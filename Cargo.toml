@@ -1,0 +1,33 @@
+[package]
+name = "procpilot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Production-grade subprocess runner with typed errors, retry, and timeout"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/michaeldhopkins/procpilot"
+homepage = "https://github.com/michaeldhopkins/procpilot"
+readme = "README.md"
+keywords = ["subprocess", "process", "command", "retry", "timeout"]
+categories = ["os", "command-line-interface"]
+
+[dependencies]
+backon = { version = "1", default-features = false, features = ["std", "std-blocking-sleep"] }
+wait-timeout = "0.2"
+
+[dev-dependencies]
+anyhow = "1"
+tempfile = "3"
+
+[lints.clippy]
+struct-excessive-bools = "deny"
+fn-params-excessive-bools = "deny"
+collapsible-if = "deny"
+too-many-arguments = "deny"
+needless-range-loop = "deny"
+extend_with_drain = "deny"
+unwrap_used = "deny"
+match_bool = "warn"
+bool_to_int_with_if = "warn"
+cognitive-complexity = "warn"
+too-many-lines = "warn"
