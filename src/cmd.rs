@@ -368,63 +368,47 @@ impl Cmd {
         }
     }
 
-    /// Spawn the command as a long-lived process handle.
+    /// Spawn the command (or pipeline) as a long-lived process handle.
     ///
-    /// **Single commands only.** Spawning pipelines will be added in a later
-    /// release; for now, pipelines should use [`run`](Self::run). Returns
-    /// [`RunError::Spawn`] with an `Unsupported` io error if called on a
-    /// pipeline.
+    /// Returns a [`SpawnedProcess`] for streaming, bidirectional protocols,
+    /// or any case where you need live access to stdin/stdout. Stdin and
+    /// stdout are always piped; stderr follows the configured
+    /// [`Redirection`] (default [`Redirection::Capture`], drained into a
+    /// background thread and surfaced on [`SpawnedProcess::wait`]).
+    ///
+    /// For pipelines, [`SpawnedProcess::take_stdin`] targets the leftmost
+    /// stage, [`SpawnedProcess::take_stdout`] the rightmost, and lifecycle
+    /// methods operate on every stage.
+    ///
+    /// If stdin bytes were set via [`stdin`](Self::stdin), they're fed
+    /// automatically in a background thread; otherwise the caller can pipe
+    /// data via [`SpawnedProcess::take_stdin`].
+    ///
+    /// `timeout`, `deadline`, and `retry` are **ignored** on this path —
+    /// they only apply to the one-shot [`run`](Self::run) method. Use
+    /// [`SpawnedProcess::wait_timeout`] or [`SpawnedProcess::kill`] for
+    /// per-call bounds.
     pub fn spawn(mut self) -> Result<SpawnedProcess, RunError> {
         let display = self.display();
-        let single = match self.tree {
-            CmdTree::Single(s) => s,
-            CmdTree::Pipe(_, _) => {
-                return Err(RunError::Spawn {
-                    command: display,
-                    source: io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Cmd::spawn on a pipeline is not yet supported; use .run()",
-                    ),
-                });
-            }
-        };
         let stdin_data = self.stdin.take();
-        let mut cmd = Command::new(&single.program);
-        single.apply_to(&mut cmd);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        apply_stderr(&mut cmd, &self.stderr_mode, &display)?;
-        if let Some(hook) = &self.before_spawn {
-            hook(&mut cmd).map_err(|source| RunError::Spawn {
-                command: display.clone(),
-                source,
-            })?;
+        let mut stages = Vec::new();
+        flatten_owned(self.tree, &mut stages);
+        match stages.len() {
+            1 => spawn_single_stage(
+                stages.into_iter().next().expect("len == 1"),
+                &self.stderr_mode,
+                self.before_spawn.as_ref(),
+                stdin_data,
+                display,
+            ),
+            _ => spawn_pipeline_stages(
+                stages,
+                &self.stderr_mode,
+                self.before_spawn.as_ref(),
+                stdin_data,
+                display,
+            ),
         }
-        let child = SharedChild::spawn(&mut cmd).map_err(|source| RunError::Spawn {
-            command: display.clone(),
-            source,
-        })?;
-        let child = Arc::new(child);
-        if let Some(data) = stdin_data
-            && let Some(mut pipe) = child.take_stdin()
-        {
-            thread::spawn(move || match data {
-                StdinData::Bytes(b) => {
-                    let _ = pipe.write_all(&b);
-                }
-                StdinData::Reader(mut r) => {
-                    let _ = io::copy(&mut r, &mut pipe);
-                }
-            });
-        }
-        let stderr_thread = if matches!(self.stderr_mode, Redirection::Capture)
-            && let Some(pipe) = child.take_stderr()
-        {
-            Some(thread::spawn(move || read_to_end(pipe)))
-        } else {
-            None
-        };
-        Ok(SpawnedProcess::new(child, stderr_thread, display))
     }
 
     /// Spawn and invoke `f` for each line of stdout as it arrives.
@@ -774,8 +758,6 @@ fn read_to_end<R: Read>(mut reader: R) -> Vec<u8> {
     buf
 }
 
-// ---------- pipeline execution ----------
-
 fn execute_pipeline(
     stages: &[&SingleCmd],
     stderr_mode: &Redirection,
@@ -786,9 +768,6 @@ fn execute_pipeline(
 ) -> Result<RunOutput, RunError> {
     debug_assert!(stages.len() >= 2);
 
-    // Build N-1 pipes between adjacent stages. Each pipe's reader and writer
-    // live in Options so we can `take` them into individual children — each
-    // half is used exactly once.
     let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
     for _ in 0..stages.len() - 1 {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
@@ -808,7 +787,6 @@ fn execute_pipeline(
         let mut cmd = Command::new(&stage.program);
         stage.apply_to(&mut cmd);
 
-        // stdin
         if i == 0 {
             match stdin_for_feed.as_ref() {
                 Some(StdinForAttempt::None) | None => {}
@@ -821,7 +799,6 @@ fn execute_pipeline(
             cmd.stdin(Stdio::from(reader));
         }
 
-        // stdout — last stage captured, others feed the next pipe.
         if i == stages.len() - 1 {
             cmd.stdout(Stdio::piped());
         } else {
@@ -843,7 +820,6 @@ fn execute_pipeline(
             source,
         })?;
 
-        // Feed stdin for the first stage (taking ownership of stdin_for_feed).
         if i == 0
             && let Some(data) = stdin_for_feed.take()
             && !matches!(data, StdinForAttempt::None)
@@ -851,14 +827,12 @@ fn execute_pipeline(
             stdin_thread = spawn_stdin_feeder(&mut child, data);
         }
 
-        // Capture stderr if Capture mode (each stage independently).
         if matches!(stderr_mode, Redirection::Capture)
             && let Some(pipe) = child.stderr.take()
         {
             stderr_threads.push(thread::spawn(move || read_to_end(pipe)));
         }
 
-        // The last stage's stdout is our captured output.
         if i == stages.len() - 1 {
             last_stdout = child.stdout.take();
         }
@@ -866,15 +840,14 @@ fn execute_pipeline(
         children.push(child);
     }
 
-    // Drain stdout of the last stage in a thread so we don't deadlock on full pipes.
+    // Drain stdout in a background thread — a chatty rightmost stage could
+    // otherwise block on a full pipe buffer and prevent the child from exiting.
     let stdout_thread = last_stdout.map(|pipe| thread::spawn(move || read_to_end(pipe)));
 
-    // Wait for all stages (with optional timeout).
     let start = Instant::now();
     let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
 
     if let Some(budget) = timeout {
-        // Simple approach: wait_timeout on each in order, deducting elapsed.
         for child in children.iter_mut() {
             let remaining = budget.saturating_sub(start.elapsed());
             if remaining.is_zero() {
@@ -912,36 +885,169 @@ fn execute_pipeline(
     let stdout_bytes = stdout_thread
         .map(|t| t.join().unwrap_or_default())
         .unwrap_or_default();
-    // Concat all stderr outputs with newlines between stages.
     let mut stderr_all = String::new();
     for t in stderr_threads {
         let bytes = t.join().unwrap_or_default();
         stderr_all.push_str(&String::from_utf8_lossy(&bytes));
     }
 
-    // pipefail-style status precedence: right-most checked error wins.
     let final_outcome = combine_outcomes(per_stage_status);
 
     finalize_outcome(display, final_outcome, stdout_bytes, stderr_all)
 }
 
+/// Duct-style pipefail: any non-success trumps success; the rightmost
+/// non-success wins. All-success returns the first exit status.
 fn combine_outcomes(outcomes: Vec<Outcome>) -> Outcome {
-    // Scan right-to-left for the last non-success outcome.
     let mut chosen: Option<Outcome> = None;
     for o in outcomes.into_iter() {
         match &o {
             Outcome::Exited(status) if status.success() => {
-                // Keep the successful status as a fallback if nothing else failed.
                 if chosen.is_none() {
                     chosen = Some(o);
                 }
             }
-            _ => chosen = Some(o), // later (rightmost) non-success replaces prior
+            _ => chosen = Some(o),
         }
     }
     chosen.unwrap_or(Outcome::WaitFailed(io::Error::other(
         "pipeline had no stages",
     )))
+}
+
+fn flatten_owned(tree: CmdTree, out: &mut Vec<SingleCmd>) {
+    match tree {
+        CmdTree::Single(s) => out.push(s),
+        CmdTree::Pipe(l, r) => {
+            flatten_owned(*l, out);
+            flatten_owned(*r, out);
+        }
+    }
+}
+
+fn spawn_single_stage(
+    single: SingleCmd,
+    stderr_mode: &Redirection,
+    before_spawn: Option<&BeforeSpawnHook>,
+    stdin_data: Option<StdinData>,
+    display: CmdDisplay,
+) -> Result<SpawnedProcess, RunError> {
+    let mut cmd = Command::new(&single.program);
+    single.apply_to(&mut cmd);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    apply_stderr(&mut cmd, stderr_mode, &display)?;
+    if let Some(hook) = before_spawn {
+        hook(&mut cmd).map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+    }
+    let child = SharedChild::spawn(&mut cmd).map_err(|source| RunError::Spawn {
+        command: display.clone(),
+        source,
+    })?;
+    let child = Arc::new(child);
+    feed_stdin_bg(&child, stdin_data);
+    let stderr_thread = capture_stderr_bg(&child, stderr_mode);
+    Ok(SpawnedProcess::new_single(child, stderr_thread, display))
+}
+
+fn spawn_pipeline_stages(
+    stages: Vec<SingleCmd>,
+    stderr_mode: &Redirection,
+    before_spawn: Option<&BeforeSpawnHook>,
+    mut stdin_data: Option<StdinData>,
+    display: CmdDisplay,
+) -> Result<SpawnedProcess, RunError> {
+    let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
+    for _ in 0..stages.len() - 1 {
+        let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+        pipes.push((Some(r), Some(w)));
+    }
+
+    let mut children: Vec<Arc<SharedChild>> = Vec::with_capacity(stages.len());
+    let mut stderr_threads: Vec<thread::JoinHandle<Vec<u8>>> = Vec::new();
+
+    for (i, stage) in stages.iter().enumerate() {
+        let mut cmd = Command::new(&stage.program);
+        stage.apply_to(&mut cmd);
+
+        if i == 0 {
+            cmd.stdin(Stdio::piped());
+        } else {
+            let reader = pipes[i - 1].0.take().expect("pipe reader");
+            cmd.stdin(Stdio::from(reader));
+        }
+
+        if i == stages.len() - 1 {
+            cmd.stdout(Stdio::piped());
+        } else {
+            let writer = pipes[i].1.take().expect("pipe writer");
+            cmd.stdout(Stdio::from(writer));
+        }
+
+        apply_stderr(&mut cmd, stderr_mode, &display)?;
+
+        if let Some(hook) = before_spawn {
+            hook(&mut cmd).map_err(|source| RunError::Spawn {
+                command: display.clone(),
+                source,
+            })?;
+        }
+
+        let child = SharedChild::spawn(&mut cmd).map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+        let child = Arc::new(child);
+
+        if i == 0 {
+            feed_stdin_bg(&child, stdin_data.take());
+        }
+        if let Some(handle) = capture_stderr_bg(&child, stderr_mode) {
+            stderr_threads.push(handle);
+        }
+
+        children.push(child);
+    }
+
+    Ok(SpawnedProcess::new_pipeline(
+        children,
+        stderr_threads,
+        display,
+    ))
+}
+
+fn feed_stdin_bg(child: &Arc<SharedChild>, stdin_data: Option<StdinData>) {
+    let Some(data) = stdin_data else {
+        return;
+    };
+    let Some(mut pipe) = child.take_stdin() else {
+        return;
+    };
+    thread::spawn(move || match data {
+        StdinData::Bytes(b) => {
+            let _ = pipe.write_all(&b);
+        }
+        StdinData::Reader(mut r) => {
+            let _ = io::copy(&mut r, &mut pipe);
+        }
+    });
+}
+
+fn capture_stderr_bg(
+    child: &Arc<SharedChild>,
+    stderr_mode: &Redirection,
+) -> Option<thread::JoinHandle<Vec<u8>>> {
+    if !matches!(stderr_mode, Redirection::Capture) {
+        return None;
+    }
+    let pipe = child.take_stderr()?;
+    Some(thread::spawn(move || read_to_end(pipe)))
 }
 
 #[cfg(test)]
@@ -965,7 +1071,6 @@ mod tests {
     #[test]
     fn pipe_builds_tree_and_args_target_rightmost() {
         let cmd = Cmd::new("a").arg("1").pipe(Cmd::new("b")).arg("right");
-        // After .arg("right"), the rightmost (b) should have one arg.
         let mut stages = Vec::new();
         cmd.tree.flatten(&mut stages);
         assert_eq!(stages.len(), 2);

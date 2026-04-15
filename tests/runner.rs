@@ -16,8 +16,6 @@ const PP_PRINT_ENV_MULTI: &str = env!("CARGO_BIN_EXE_pp_print_env_multi");
 const PP_PWD: &str = env!("CARGO_BIN_EXE_pp_pwd");
 const PP_SPAM: &str = env!("CARGO_BIN_EXE_pp_spam");
 
-// --- basic capture ---
-
 #[test]
 fn captures_stdout() {
     let out = Cmd::new(PP_ECHO).arg("hello").run().expect("ok");
@@ -56,8 +54,6 @@ fn missing_binary_is_spawn_failure() {
     assert!(err.is_spawn_failure());
 }
 
-// --- in_dir ---
-
 #[test]
 fn in_dir_sets_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -78,8 +74,6 @@ fn in_dir_nonexistent_is_spawn_failure() {
         .expect_err("fail");
     assert!(err.is_spawn_failure());
 }
-
-// --- env ---
 
 #[test]
 fn env_sets_single() {
@@ -111,8 +105,6 @@ fn env_overrides_existing_var() {
     assert_eq!(out.stdout_lossy().trim(), "/fake/home");
 }
 
-// --- stdin ---
-
 #[test]
 fn stdin_bytes_fed_to_child() {
     let out = Cmd::new(PP_CAT).stdin("piped input").run().expect("ok");
@@ -137,8 +129,6 @@ fn stdin_vec_bytes() {
         .expect("ok");
     assert_eq!(out.stdout_lossy(), "hi");
 }
-
-// --- timeout ---
 
 #[test]
 fn timeout_fast_command_succeeds() {
@@ -184,8 +174,6 @@ fn timeout_does_not_block_on_large_output() {
     assert!(out.stdout.len() >= 200_000);
 }
 
-// --- deadline ---
-
 #[test]
 fn deadline_overrides_timeout_when_tighter() {
     let start = Instant::now();
@@ -198,8 +186,6 @@ fn deadline_overrides_timeout_when_tighter() {
     assert!(err.is_timeout());
     assert!(start.elapsed() < Duration::from_secs(2));
 }
-
-// --- retry ---
 
 #[test]
 fn retry_does_not_fire_on_non_transient_error() {
@@ -222,8 +208,6 @@ fn retry_when_custom_predicate_can_stop_retrying() {
     assert!(err.is_non_zero_exit());
 }
 
-// --- stderr redirection ---
-
 #[test]
 fn stderr_null_discards() {
     let err = Cmd::new(PP_STATUS)
@@ -234,8 +218,6 @@ fn stderr_null_discards() {
     // stderr was discarded, so the captured field is empty.
     assert_eq!(err.stderr(), Some(""));
 }
-
-// --- secret ---
 
 #[test]
 fn secret_redacts_in_error_display() {
@@ -248,8 +230,6 @@ fn secret_redacts_in_error_display() {
     assert!(!msg.contains("sensitive"), "secret leaked: {msg}");
     assert!(msg.contains("<secret>"));
 }
-
-// --- binary helpers ---
 
 #[test]
 fn binary_available_true_for_exit_zero() {
@@ -265,8 +245,6 @@ fn binary_available_false_for_missing() {
 fn binary_version_none_for_missing() {
     assert!(procpilot::binary_version("nonexistent_binary_xyz_42").is_none());
 }
-
-// --- before_spawn ---
 
 #[test]
 fn before_spawn_hook_invoked() {

@@ -1,8 +1,9 @@
 //! Integration tests for pipelines (`Cmd::pipe` / `BitOr`).
 
+use std::io::{Read, Write};
 use std::time::Duration;
 
-use procpilot::{Cmd, RunError};
+use procpilot::Cmd;
 
 const PP_ECHO: &str = env!("CARGO_BIN_EXE_pp_echo");
 const PP_CAT: &str = env!("CARGO_BIN_EXE_pp_cat");
@@ -10,11 +11,8 @@ const PP_STATUS: &str = env!("CARGO_BIN_EXE_pp_status");
 const PP_SLEEP: &str = env!("CARGO_BIN_EXE_pp_sleep");
 const PP_SPAM: &str = env!("CARGO_BIN_EXE_pp_spam");
 
-// --- basic pipe: a | b ---
-
 #[test]
 fn two_stage_pipe_passes_stdout_to_stdin() {
-    // pp_echo prints "hello"; pp_cat echoes stdin to stdout.
     let out = Cmd::new(PP_ECHO)
         .arg("hello")
         .pipe(Cmd::new(PP_CAT))
@@ -31,8 +29,6 @@ fn bitor_operator_produces_same_result() {
     assert_eq!(out.stdout_lossy().trim(), "via-bitor");
 }
 
-// --- three-stage pipeline ---
-
 #[test]
 fn three_stage_pipeline_runs_in_order() {
     let out = Cmd::new(PP_ECHO)
@@ -44,11 +40,8 @@ fn three_stage_pipeline_runs_in_order() {
     assert_eq!(out.stdout_lossy().trim(), "staged");
 }
 
-// --- pipefail: rightmost failure wins ---
-
 #[test]
 fn pipefail_rightmost_failure_wins() {
-    // echo (ok) | status 2 (fail)  →  error with exit status 2
     let err = Cmd::new(PP_ECHO)
         .arg("x")
         .pipe(Cmd::new(PP_STATUS).arg("2"))
@@ -60,8 +53,9 @@ fn pipefail_rightmost_failure_wins() {
 
 #[test]
 fn pipefail_middle_failure_surfaces_when_later_stages_succeed() {
-    // status 7 (fail) | cat (ok)  →  failure with exit status 7 wins
-    // (rightmost NON-SUCCESS wins; cat succeeds, status 7 is the only failure)
+    // Pipefail picks the rightmost non-success; when only the middle stage
+    // fails, that failure must still surface — not silently hidden by the
+    // later stage's success.
     let err = Cmd::new(PP_STATUS)
         .args(["7", "--out", "ignored"])
         .pipe(Cmd::new(PP_CAT))
@@ -70,8 +64,6 @@ fn pipefail_middle_failure_surfaces_when_later_stages_succeed() {
     assert!(err.is_non_zero_exit());
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(7));
 }
-
-// --- stdin feeds first stage ---
 
 #[test]
 fn stdin_feeds_leftmost_stage() {
@@ -82,8 +74,6 @@ fn stdin_feeds_leftmost_stage() {
         .expect("ok");
     assert_eq!(out.stdout_lossy().trim(), "piped through two cats");
 }
-
-// --- stderr capture concatenates from all stages ---
 
 #[test]
 fn stderr_captures_from_all_stages_concatenated() {
@@ -97,8 +87,6 @@ fn stderr_captures_from_all_stages_concatenated() {
     assert!(stderr.contains("second-err"), "got: {stderr:?}");
 }
 
-// --- timeout on pipeline ---
-
 #[test]
 fn pipeline_timeout_kills_hung_stage() {
     let err = Cmd::new(PP_SLEEP)
@@ -110,8 +98,6 @@ fn pipeline_timeout_kills_hung_stage() {
     assert!(err.is_timeout());
 }
 
-// --- large output doesn't deadlock ---
-
 #[test]
 fn pipeline_does_not_deadlock_on_large_output() {
     let out = Cmd::new(PP_SPAM)
@@ -122,12 +108,11 @@ fn pipeline_does_not_deadlock_on_large_output() {
     assert!(out.stdout.len() >= 100_000);
 }
 
-// --- env/args target rightmost after pipe ---
-
 #[test]
 fn args_after_pipe_target_rightmost() {
-    // Cmd::new(PP_ECHO) pipes to PP_CAT with no args; but if we do
-    // .pipe(PP_ECHO).arg("X"), then rightmost PP_ECHO gets "X".
+    // pp_echo ignores stdin, so the final output comes from the rightmost
+    // stage's args — proving that .arg("overrides") attached to the correct
+    // (rightmost) stage rather than to the first.
     let out = Cmd::new(PP_ECHO)
         .arg("first")
         .pipe(Cmd::new(PP_CAT))
@@ -135,27 +120,67 @@ fn args_after_pipe_target_rightmost() {
         .arg("overrides")
         .run()
         .expect("ok");
-    // PP_ECHO at the end ignores stdin and prints "overrides".
     assert_eq!(out.stdout_lossy().trim(), "overrides");
 }
 
-// --- spawn on pipeline returns Unsupported ---
-
 #[test]
-fn spawn_on_pipeline_is_unsupported() {
-    let err = Cmd::new(PP_ECHO)
+fn spawn_on_pipeline_returns_all_pids() {
+    let proc = Cmd::new(PP_ECHO)
+        .arg("hi")
         .pipe(Cmd::new(PP_CAT))
         .spawn()
-        .expect_err("pipelines can't spawn yet");
-    match err {
-        RunError::Spawn { source, .. } => {
-            assert_eq!(source.kind(), std::io::ErrorKind::Unsupported);
-        }
-        _ => panic!("expected Spawn unsupported, got {err:?}"),
-    }
+        .expect("spawn");
+    assert!(proc.is_pipeline());
+    assert_eq!(proc.pids().len(), 2);
+    let out = proc.wait().expect("wait");
+    assert_eq!(out.stdout_lossy().trim(), "hi");
 }
 
-// --- display renders pipeline ---
+#[test]
+fn spawn_pipeline_bidirectional_take_stdin_and_stdout() {
+    let proc = Cmd::new(PP_CAT)
+        .pipe(Cmd::new(PP_CAT))
+        .spawn()
+        .expect("spawn");
+    let mut stdin = proc.take_stdin().expect("stdin");
+    let mut stdout = proc.take_stdout().expect("stdout");
+
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(b"piped via two cats").expect("write");
+        drop(stdin);
+    });
+
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).expect("read");
+    writer.join().expect("join");
+    let _ = proc.wait();
+    assert_eq!(buf, "piped via two cats");
+}
+
+#[test]
+fn spawn_pipeline_kill_sends_to_all_stages() {
+    let proc = Cmd::new(PP_SLEEP)
+        .arg("10000")
+        .pipe(Cmd::new(PP_CAT))
+        .spawn()
+        .expect("spawn");
+    proc.kill().expect("kill");
+    // If kill only reached the first stage, wait would hang on pp_cat waiting
+    // for its stdin to close — so this line is the real assertion.
+    let _ = proc.wait();
+}
+
+#[test]
+fn spawn_pipeline_pipefail_on_wait() {
+    let proc = Cmd::new(PP_ECHO)
+        .arg("x")
+        .pipe(Cmd::new(PP_STATUS).arg("3"))
+        .spawn()
+        .expect("spawn");
+    let err = proc.wait().expect_err("should fail");
+    assert!(err.is_non_zero_exit());
+    assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
+}
 
 #[test]
 fn display_renders_shell_style_pipeline() {
