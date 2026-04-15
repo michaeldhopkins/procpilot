@@ -160,9 +160,17 @@ mod tests {
     }
 
     fn non_zero_exit(stderr: &str) -> RunError {
-        let status = std::process::Command::new("false")
-            .status()
-            .expect("false should be runnable");
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(256) // exit code 1 encoded in high byte
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        };
+
         RunError::NonZeroExit {
             program: "git".into(),
             args: vec!["status".into()],
@@ -264,4 +272,5 @@ mod tests {
         let err = spawn_error();
         let _: anyhow::Error = err.into();
     }
+
 }

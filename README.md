@@ -136,14 +136,6 @@ if binary_available("docker") {
 }
 ```
 
-## Design decisions
-
-- **`Vec<u8>` stdout, `String` stderr.** Stdout can be binary; stderr is conventionally text. Asymmetric by design.
-- **`NonZeroExit` is an error, not a normal return.** Forces the caller to opt into handling command-reported failures via `match`, rather than accidentally ignoring a missed status check.
-- **Timeouts drain pipes in threads.** A simple `wait_timeout` without draining will hang forever if the child fills the pipe buffer. This is a subtle production-grade correctness concern that a scripting library can skip.
-- **No trait abstraction.** `Vcs`-style traits belong in consumer code where the specific needs are known. `procpilot` provides primitives.
-- **`#[non_exhaustive]` on `RunError`.** New failure modes can be added without breaking callers.
-
 ## License
 
 Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

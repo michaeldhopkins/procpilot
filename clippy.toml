@@ -1,0 +1,20 @@
+# Clippy configuration for procpilot
+# These thresholds prevent architectural regression while allowing current state
+
+# Max bool fields in a struct before suggesting an enum
+max-struct-bools = 2
+
+# Max bool params in a function before suggesting an enum
+max-fn-params-bools = 2
+
+# Cognitive complexity threshold (default is 25)
+cognitive-complexity-threshold = 30
+
+# Max lines in a function - set above current max to catch growth
+too-many-lines-threshold = 275
+
+# Max function arguments - procpilot is a library with focused APIs
+too-many-arguments-threshold = 10
+
+# Allow .unwrap() in test code
+allow-unwrap-in-tests = true

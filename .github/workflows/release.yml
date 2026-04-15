@@ -53,14 +53,19 @@ jobs:
       - name: cargo check
         run: cargo check --locked
 
-      - name: cargo test
-        run: cargo test --locked
+      - name: cargo test (unit tests only — no features)
+        run: cargo test --locked --lib
 
-      - name: cargo test (no default features)
-        run: cargo test --locked --no-default-features
+      - name: cargo test (all features, incl. integration tests)
+        run: cargo test --locked --all-features
 
-      - name: cargo clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo clippy (all features)
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+
+      - name: cargo doc (catches broken links)
+        run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
       - uses: taiki-e/install-action@cargo-deny
 
