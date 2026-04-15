@@ -7,12 +7,12 @@
 
 use std::io;
 
-use procpilot::RunError;
+use procpilot::{Cmd, RunError};
 
 #[test]
 fn run_error_stays_non_exhaustive() {
     let err = RunError::Spawn {
-        program: "x".into(),
+        command: Cmd::new("x").display(),
         source: io::Error::other("x"),
     };
 
