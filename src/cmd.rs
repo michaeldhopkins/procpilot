@@ -39,7 +39,7 @@ use std::io::{self, Read, Write};
 use std::ops::BitOr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -159,15 +159,62 @@ impl CmdTree {
 /// [`retry_when`](Self::retry_when), [`secret`](Self::secret),
 /// [`before_spawn`](Self::before_spawn) — apply to the whole pipeline.
 #[must_use = "Cmd does nothing until .run() or .spawn() is called"]
+#[derive(Clone)]
 pub struct Cmd {
     tree: CmdTree,
-    stdin: Option<StdinData>,
+    stdin: Option<SharedStdin>,
     stderr_mode: Redirection,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
     retry: Option<RetryPolicy>,
     before_spawn: Option<BeforeSpawnHook>,
     secret: bool,
+}
+
+/// Cloneable internal wrapper around [`StdinData`].
+///
+/// For `Bytes`, clones share the same buffer via `Arc<Vec<u8>>` — cheap and
+/// lets every retry or clone re-feed the same data. For `Reader`, clones
+/// share a `Mutex<Option<…>>` — whichever attempt runs first takes the
+/// reader; subsequent attempts (or concurrent clones) see `None`.
+#[derive(Clone)]
+enum SharedStdin {
+    Bytes(Arc<Vec<u8>>),
+    Reader(Arc<Mutex<Option<Box<dyn Read + Send + Sync>>>>),
+}
+
+impl SharedStdin {
+    fn from_data(data: StdinData) -> Self {
+        match data {
+            StdinData::Bytes(b) => Self::Bytes(Arc::new(b)),
+            StdinData::Reader(r) => Self::Reader(Arc::new(Mutex::new(Some(r)))),
+        }
+    }
+
+    fn take_for_attempt(&self) -> StdinForAttempt {
+        match self {
+            Self::Bytes(b) => StdinForAttempt::Bytes(Arc::clone(b)),
+            Self::Reader(r) => match r.lock() {
+                Ok(mut guard) => match guard.take() {
+                    Some(reader) => StdinForAttempt::Reader(reader),
+                    None => StdinForAttempt::None,
+                },
+                Err(_) => StdinForAttempt::None,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for SharedStdin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bytes(b) => f
+                .debug_struct("Bytes")
+                .field("len", &b.len())
+                .finish(),
+            Self::Reader(_) => f.debug_struct("Reader").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl fmt::Debug for Cmd {
@@ -281,7 +328,7 @@ impl Cmd {
 
     /// Feed data into the leftmost stage's stdin.
     pub fn stdin(mut self, data: impl Into<StdinData>) -> Self {
-        self.stdin = Some(data.into());
+        self.stdin = Some(SharedStdin::from_data(data.into()));
         self
     }
 
@@ -335,8 +382,10 @@ impl Cmd {
     }
 
     /// Build a raw `std::process::Command` mirroring the rightmost stage.
-    /// Only meaningful for single-command invocations; for pipelines, returns
-    /// the right-hand stage.
+    ///
+    /// Only meaningful for single-command invocations; for pipelines this
+    /// returns **only** the rightmost stage — the upstream ones are lost.
+    /// For pipelines, use [`to_commands`](Self::to_commands) instead.
     pub fn to_command(&self) -> Command {
         let single = match &self.tree {
             CmdTree::Single(s) => s,
@@ -345,6 +394,26 @@ impl Cmd {
         let mut cmd = Command::new(&single.program);
         single.apply_to(&mut cmd);
         cmd
+    }
+
+    /// Build one raw `std::process::Command` per stage, leftmost first.
+    ///
+    /// Stdio wiring between stages is **not** set up — callers are
+    /// responsible for piping the returned `Command`s together if they need
+    /// the full shell-style behavior. For the typical case where you just
+    /// want to execute the pipeline, use [`run`](Self::run) or
+    /// [`spawn`](Self::spawn).
+    pub fn to_commands(&self) -> Vec<Command> {
+        let mut leaves = Vec::new();
+        self.tree.flatten(&mut leaves);
+        leaves
+            .into_iter()
+            .map(|s| {
+                let mut cmd = Command::new(&s.program);
+                s.apply_to(&mut cmd);
+                cmd
+            })
+            .collect()
     }
 
     /// Snapshot the command (or pipeline) for display/logging.
@@ -390,7 +459,8 @@ impl Cmd {
     /// per-call bounds.
     pub fn spawn(mut self) -> Result<SpawnedProcess, RunError> {
         let display = self.display();
-        let stdin_data = self.stdin.take();
+        let stdin_shared = self.stdin.take();
+        let stdin_attempt = attempt_stdin(&stdin_shared);
         let mut stages = Vec::new();
         flatten_owned(self.tree, &mut stages);
         match stages.len() {
@@ -398,14 +468,14 @@ impl Cmd {
                 stages.into_iter().next().expect("len == 1"),
                 &self.stderr_mode,
                 self.before_spawn.as_ref(),
-                stdin_data,
+                stdin_attempt,
                 display,
             ),
             _ => spawn_pipeline_stages(
                 stages,
                 &self.stderr_mode,
                 self.before_spawn.as_ref(),
-                stdin_data,
+                stdin_attempt,
                 display,
             ),
         }
@@ -463,16 +533,16 @@ impl Cmd {
     /// Run the command (or pipeline), blocking until it completes (or times out).
     pub fn run(mut self) -> Result<RunOutput, RunError> {
         let display = self.display();
-        let mut stdin_holder = StdinHolder::from_opt(self.stdin.take());
+        let stdin = self.stdin.take();
         let retry = self.retry.take();
 
-        let op = |stdin: StdinForAttempt, per_attempt: Option<Duration>| match &self.tree {
+        let op = |stdin_attempt: StdinForAttempt, per_attempt: Option<Duration>| match &self.tree {
             CmdTree::Single(single) => execute_single(
                 single,
                 &self.stderr_mode,
                 self.before_spawn.as_ref(),
                 &display,
-                stdin,
+                stdin_attempt,
                 per_attempt,
             ),
             CmdTree::Pipe(_, _) => {
@@ -483,16 +553,16 @@ impl Cmd {
                     &self.stderr_mode,
                     self.before_spawn.as_ref(),
                     &display,
-                    stdin,
+                    stdin_attempt,
                     per_attempt,
                 )
             }
         };
 
         match retry {
-            None => op(stdin_holder.take_for_attempt(), self.per_attempt_timeout(Instant::now())),
+            None => op(attempt_stdin(&stdin), self.per_attempt_timeout(Instant::now())),
             Some(policy) => run_with_retry(
-                &mut stdin_holder,
+                &stdin,
                 policy,
                 self.timeout,
                 self.deadline,
@@ -519,7 +589,7 @@ fn right_leaf(tree: &CmdTree) -> &SingleCmd {
 }
 
 fn run_with_retry<F>(
-    stdin_holder: &mut StdinHolder,
+    stdin: &Option<SharedStdin>,
     policy: RetryPolicy,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
@@ -548,8 +618,7 @@ where
             (None, Some(d)) => Some(d.saturating_duration_since(now)),
             (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
         };
-        let stdin = stdin_holder.take_for_attempt();
-        op(stdin, per_attempt)
+        op(attempt_stdin(stdin), per_attempt)
     };
     attempt
         .retry(policy.backoff)
@@ -557,37 +626,17 @@ where
         .call()
 }
 
-enum StdinHolder {
-    None,
-    Bytes(Vec<u8>),
-    OneShotReader(Option<Box<dyn Read + Send + Sync>>),
-}
-
-impl StdinHolder {
-    fn from_opt(d: Option<StdinData>) -> Self {
-        match d {
-            None => Self::None,
-            Some(StdinData::Bytes(b)) => Self::Bytes(b),
-            Some(StdinData::Reader(r)) => Self::OneShotReader(Some(r)),
-        }
-    }
-
-    fn take_for_attempt(&mut self) -> StdinForAttempt {
-        match self {
-            Self::None => StdinForAttempt::None,
-            Self::Bytes(b) => StdinForAttempt::Bytes(b.clone()),
-            Self::OneShotReader(slot) => match slot.take() {
-                Some(r) => StdinForAttempt::Reader(r),
-                None => StdinForAttempt::None,
-            },
-        }
-    }
-}
-
 enum StdinForAttempt {
     None,
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
     Reader(Box<dyn Read + Send + Sync>),
+}
+
+fn attempt_stdin(shared: &Option<SharedStdin>) -> StdinForAttempt {
+    match shared {
+        None => StdinForAttempt::None,
+        Some(s) => s.take_for_attempt(),
+    }
 }
 
 enum Outcome {
@@ -612,7 +661,7 @@ fn apply_stderr(
             cmd.stderr(Stdio::null());
         }
         Redirection::File(f) => {
-            let cloned = f.try_clone().map_err(|source| RunError::Spawn {
+            let cloned = f.as_ref().try_clone().map_err(|source| RunError::Spawn {
                 command: display.clone(),
                 source,
             })?;
@@ -748,6 +797,29 @@ fn spawn_stdin_feeder(
             Some(thread::spawn(move || {
                 let _ = io::copy(&mut reader, &mut pipe);
             }))
+        }
+    }
+}
+
+fn spawn_stdin_feeder_shared(child: &Arc<SharedChild>, stdin: StdinForAttempt) {
+    // Only take stdin when we actually have bytes / a reader — otherwise
+    // leaving the pipe attached lets the caller grab it via
+    // `SpawnedProcess::take_stdin` for interactive writes.
+    match stdin {
+        StdinForAttempt::None => {}
+        StdinForAttempt::Bytes(bytes) => {
+            if let Some(mut pipe) = child.take_stdin() {
+                thread::spawn(move || {
+                    let _ = pipe.write_all(&bytes);
+                });
+            }
+        }
+        StdinForAttempt::Reader(mut reader) => {
+            if let Some(mut pipe) = child.take_stdin() {
+                thread::spawn(move || {
+                    let _ = io::copy(&mut reader, &mut pipe);
+                });
+            }
         }
     }
 }
@@ -929,7 +1001,7 @@ fn spawn_single_stage(
     single: SingleCmd,
     stderr_mode: &Redirection,
     before_spawn: Option<&BeforeSpawnHook>,
-    stdin_data: Option<StdinData>,
+    stdin_attempt: StdinForAttempt,
     display: CmdDisplay,
 ) -> Result<SpawnedProcess, RunError> {
     let mut cmd = Command::new(&single.program);
@@ -948,7 +1020,7 @@ fn spawn_single_stage(
         source,
     })?;
     let child = Arc::new(child);
-    feed_stdin_bg(&child, stdin_data);
+    spawn_stdin_feeder_shared(&child, stdin_attempt);
     let stderr_thread = capture_stderr_bg(&child, stderr_mode);
     Ok(SpawnedProcess::new_single(child, stderr_thread, display))
 }
@@ -957,7 +1029,7 @@ fn spawn_pipeline_stages(
     stages: Vec<SingleCmd>,
     stderr_mode: &Redirection,
     before_spawn: Option<&BeforeSpawnHook>,
-    mut stdin_data: Option<StdinData>,
+    mut stdin_attempt: StdinForAttempt,
     display: CmdDisplay,
 ) -> Result<SpawnedProcess, RunError> {
     let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
@@ -1006,7 +1078,8 @@ fn spawn_pipeline_stages(
         let child = Arc::new(child);
 
         if i == 0 {
-            feed_stdin_bg(&child, stdin_data.take());
+            let attempt = std::mem::replace(&mut stdin_attempt, StdinForAttempt::None);
+            spawn_stdin_feeder_shared(&child, attempt);
         }
         if let Some(handle) = capture_stderr_bg(&child, stderr_mode) {
             stderr_threads.push(handle);
@@ -1020,23 +1093,6 @@ fn spawn_pipeline_stages(
         stderr_threads,
         display,
     ))
-}
-
-fn feed_stdin_bg(child: &Arc<SharedChild>, stdin_data: Option<StdinData>) {
-    let Some(data) = stdin_data else {
-        return;
-    };
-    let Some(mut pipe) = child.take_stdin() else {
-        return;
-    };
-    thread::spawn(move || match data {
-        StdinData::Bytes(b) => {
-            let _ = pipe.write_all(&b);
-        }
-        StdinData::Reader(mut r) => {
-            let _ = io::copy(&mut r, &mut pipe);
-        }
-    });
 }
 
 fn capture_stderr_bg(
@@ -1165,5 +1221,45 @@ mod tests {
         let cmd = Cmd::new("a").pipe(Cmd::new("b"));
         let std_cmd = cmd.to_command();
         assert_eq!(std_cmd.get_program(), "b");
+    }
+
+    #[test]
+    fn to_commands_returns_all_stages_left_to_right() {
+        let cmd = Cmd::new("a").pipe(Cmd::new("b")).pipe(Cmd::new("c"));
+        let cmds = cmd.to_commands();
+        let progs: Vec<_> = cmds.iter().map(|c| c.get_program().to_os_string()).collect();
+        assert_eq!(progs, vec![OsString::from("a"), OsString::from("b"), OsString::from("c")]);
+    }
+
+    #[test]
+    fn cmd_is_clone_and_divergent_after_clone() {
+        // Template pattern: configure a base Cmd, clone to make variants.
+        let base = Cmd::new("git").in_dir("/repo").env("K", "V");
+        let c1 = base.clone().args(["status"]);
+        let c2 = base.clone().args(["log", "-1"]);
+
+        let mut s1 = Vec::new();
+        c1.tree.flatten(&mut s1);
+        let mut s2 = Vec::new();
+        c2.tree.flatten(&mut s2);
+        assert_eq!(s1[0].args, vec![OsString::from("status")]);
+        assert_eq!(s2[0].args, vec![OsString::from("log"), OsString::from("-1")]);
+    }
+
+    #[test]
+    fn clone_shares_bytes_stdin_cheaply() {
+        let original = Cmd::new("x").stdin(b"big input".to_vec());
+        let clone = original.clone();
+        // Arc shares the underlying Vec; both clones observe the same len.
+        let a = match original.stdin.as_ref().unwrap() {
+            SharedStdin::Bytes(b) => Arc::strong_count(b),
+            _ => unreachable!(),
+        };
+        let b = match clone.stdin.as_ref().unwrap() {
+            SharedStdin::Bytes(b) => Arc::strong_count(b),
+            _ => unreachable!(),
+        };
+        assert_eq!(a, b);
+        assert!(a >= 2);
     }
 }
