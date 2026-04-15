@@ -16,12 +16,13 @@ Built for CLI tools that spawn external processes and need precise failure handl
 - **Stdin piping** — owned bytes (reusable across retries) or a boxed `Read` (one-shot streaming).
 - **Stderr routing** — capture / inherit / null / redirect-to-file via [`Redirection`].
 - **Secret redaction** — [`Cmd::secret`] replaces args with `<secret>` in error output and logs.
+- **Streaming / bidirectional** — [`Cmd::spawn`] returns a [`SpawnedProcess`] with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines` for line-by-line callbacks.
 
 ## Usage
 
 ```toml
 [dependencies]
-procpilot = "0.2"
+procpilot = "0.3"
 ```
 
 ```rust
@@ -105,6 +106,53 @@ use procpilot::Cmd;
 
 let manifest = "apiVersion: v1\nkind: ConfigMap\n...";
 Cmd::new("kubectl").args(["apply", "-f", "-"]).stdin(manifest).run()?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+### Streaming (spawned processes)
+
+For long-lived or bidirectional processes, use [`Cmd::spawn`] instead of `.run()`. The returned `SpawnedProcess` gives you ownership of stdin/stdout pipes and `&self` `wait` / `kill` so you can share the handle across threads.
+
+```rust
+use std::io::{BufRead, BufReader, Write};
+use std::thread;
+use procpilot::Cmd;
+
+// `git cat-file --batch` pattern: write requests on one thread, read
+// responses on another.
+let proc = Cmd::new("git")
+    .args(["cat-file", "--batch"])
+    .in_dir("/repo")
+    .spawn()?;
+
+let mut stdin = proc.take_stdin().expect("piped");
+let stdout = proc.take_stdout().expect("piped");
+
+thread::spawn(move || {
+    writeln!(stdin, "HEAD").ok();
+    // drop(stdin) sends EOF
+});
+
+let mut reader = BufReader::new(stdout);
+let mut header = String::new();
+reader.read_line(&mut header)?;
+// ... parse headers + binary content ...
+
+let _ = proc.wait();
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+For the common "read lines as they arrive" case:
+
+```rust
+use procpilot::Cmd;
+
+Cmd::new("cargo")
+    .args(["check", "--message-format=json"])
+    .spawn_and_collect_lines(|line| {
+        // e.g., serde_json::from_str(line)?;
+        Ok(())
+    })?;
 # Ok::<(), procpilot::RunError>(())
 ```
 

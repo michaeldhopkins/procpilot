@@ -4,6 +4,20 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-14
+
+### Features
+
+- **`Cmd::spawn`** — new entry point returning a [`SpawnedProcess`] handle for long-lived or bidirectional processes (`git cat-file --batch`, `kubectl logs -f`, `cargo check --message-format=json`). Covers the main use case that previously forced callers back to raw `std::process::Command`.
+- `SpawnedProcess` methods: `take_stdin` / `take_stdout` (one-shot ownership of the pipes), `pids`, `kill`, `try_wait`, `wait`, `wait_timeout`. Lifecycle methods take `&self` so the handle shares cleanly across threads.
+- Dual `Read` impls (`impl Read for SpawnedProcess` and `impl Read for &SpawnedProcess`) — read stdout through the handle; reference impl lets one thread read while another calls `kill`.
+- `Cmd::spawn_and_collect_lines` — high-level helper for the line-streaming case; runs a `FnMut(&str) -> io::Result<()>` per line and returns the final `RunOutput`.
+- Stderr (when `Redirection::Capture`) is drained into a background thread and attached to the `RunOutput` / `RunError` when `wait` resolves.
+
+### Implementation
+
+- Uses [`shared_child`](https://crates.io/crates/shared_child) 1.1 for lock-free concurrent kill-while-waiting.
+
 ## [0.2.0] - 2026-04-12
 
 ### Breaking changes
