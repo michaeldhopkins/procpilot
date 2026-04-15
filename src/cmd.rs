@@ -24,12 +24,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use backon::BlockingRetryable;
+use shared_child::SharedChild;
 use wait_timeout::ChildExt;
 
 use crate::cmd_display::CmdDisplay;
 use crate::error::{RunError, truncate_suffix, truncate_suffix_string};
 use crate::redirection::Redirection;
 use crate::retry::RetryPolicy;
+use crate::spawned::SpawnedProcess;
 use crate::stdin::StdinData;
 
 /// Hook invoked on `std::process::Command` immediately before each spawn attempt.
@@ -257,6 +259,156 @@ impl Cmd {
     /// Snapshot the command for display/logging.
     pub fn display(&self) -> CmdDisplay {
         CmdDisplay::new(self.program.clone(), self.args.clone(), self.secret)
+    }
+
+    /// Spawn the command as a long-lived process handle.
+    ///
+    /// Returns a [`SpawnedProcess`] for streaming, bidirectional protocols,
+    /// or any case where you need live access to stdin/stdout. Stdin and
+    /// stdout are always piped; stderr follows the configured
+    /// [`Redirection`] (default [`Redirection::Capture`], drained into a
+    /// background thread and surfaced on [`SpawnedProcess::wait`]).
+    ///
+    /// If stdin bytes were set via [`stdin`](Self::stdin), they're fed
+    /// automatically in a background thread; otherwise the caller can pipe
+    /// data via [`SpawnedProcess::take_stdin`].
+    ///
+    /// `timeout`, `deadline`, and `retry` are **ignored** on this path —
+    /// they only apply to the one-shot [`run`](Self::run) method. Use
+    /// [`SpawnedProcess::wait_timeout`] or [`SpawnedProcess::kill`] for
+    /// per-call bounds.
+    pub fn spawn(mut self) -> Result<SpawnedProcess, RunError> {
+        let display = self.display();
+        let stdin_data = self.stdin.take();
+
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        if let Some(dir) = &self.cwd {
+            cmd.current_dir(dir);
+        }
+        if self.env_clear {
+            cmd.env_clear();
+        }
+        for key in &self.env_remove {
+            cmd.env_remove(key);
+        }
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        match &self.stderr_mode {
+            Redirection::Capture => {
+                cmd.stderr(Stdio::piped());
+            }
+            Redirection::Inherit => {
+                cmd.stderr(Stdio::inherit());
+            }
+            Redirection::Null => {
+                cmd.stderr(Stdio::null());
+            }
+            Redirection::File(f) => {
+                let cloned = f.try_clone().map_err(|source| RunError::Spawn {
+                    command: display.clone(),
+                    source,
+                })?;
+                cmd.stderr(Stdio::from(cloned));
+            }
+        }
+
+        if let Some(hook) = &self.before_spawn {
+            hook(&mut cmd).map_err(|source| RunError::Spawn {
+                command: display.clone(),
+                source,
+            })?;
+        }
+
+        let child = SharedChild::spawn(&mut cmd).map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+        let child = Arc::new(child);
+
+        // If caller supplied stdin data, feed it in a background thread so
+        // they can still call take_stdout without blocking on a full pipe.
+        if let Some(data) = stdin_data
+            && let Some(mut pipe) = child.take_stdin()
+        {
+            thread::spawn(move || {
+                use std::io::Write;
+                match data {
+                    StdinData::Bytes(b) => {
+                        let _ = pipe.write_all(&b);
+                    }
+                    StdinData::Reader(mut r) => {
+                        let _ = io::copy(&mut r, &mut pipe);
+                    }
+                }
+            });
+        }
+
+        // Drain stderr in the background (Capture mode only).
+        let stderr_thread = if matches!(self.stderr_mode, Redirection::Capture)
+            && let Some(pipe) = child.take_stderr()
+        {
+            Some(thread::spawn(move || read_to_end(pipe)))
+        } else {
+            None
+        };
+
+        Ok(SpawnedProcess::new(child, stderr_thread, display))
+    }
+
+    /// Spawn and invoke `f` for each line of stdout as it arrives.
+    ///
+    /// Returns the final [`RunOutput`] when the child exits, or a
+    /// [`RunError::NonZeroExit`] if it exited non-zero. If `f` returns an
+    /// error, the child is killed and the error is surfaced as
+    /// [`RunError::Spawn`].
+    ///
+    /// ```no_run
+    /// # use procpilot::Cmd;
+    /// Cmd::new("cargo")
+    ///     .args(["check", "--message-format=json"])
+    ///     .spawn_and_collect_lines(|line| {
+    ///         println!("{line}");
+    ///         Ok(())
+    ///     })?;
+    /// # Ok::<(), procpilot::RunError>(())
+    /// ```
+    pub fn spawn_and_collect_lines<F>(self, mut f: F) -> Result<RunOutput, RunError>
+    where
+        F: FnMut(&str) -> io::Result<()>,
+    {
+        let proc = self.spawn()?;
+        let stdout = proc
+            .take_stdout()
+            .expect("spawn always pipes stdout");
+        let reader = std::io::BufReader::new(stdout);
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(source) => {
+                    let _ = proc.kill();
+                    let _ = proc.wait();
+                    return Err(RunError::Spawn {
+                        command: proc.command().clone(),
+                        source,
+                    });
+                }
+            };
+            if let Err(source) = f(&line) {
+                let _ = proc.kill();
+                let _ = proc.wait();
+                return Err(RunError::Spawn {
+                    command: proc.command().clone(),
+                    source,
+                });
+            }
+        }
+        proc.wait()
     }
 
     /// Run the command, blocking until it completes (or times out).

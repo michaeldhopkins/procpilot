@@ -46,6 +46,7 @@ mod error;
 mod redirection;
 mod retry;
 mod runner;
+mod spawned;
 mod stdin;
 
 pub use cmd::{BeforeSpawnHook, Cmd, RunOutput};
@@ -54,4 +55,5 @@ pub use error::{RunError, STREAM_SUFFIX_SIZE};
 pub use redirection::Redirection;
 pub use retry::{RetryPolicy, default_transient};
 pub use runner::{binary_available, binary_version};
+pub use spawned::SpawnedProcess;
 pub use stdin::StdinData;
