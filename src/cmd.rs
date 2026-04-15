@@ -158,6 +158,15 @@ impl CmdTree {
 /// [`deadline`](Self::deadline), [`retry`](Self::retry),
 /// [`retry_when`](Self::retry_when), [`secret`](Self::secret),
 /// [`before_spawn`](Self::before_spawn) — apply to the whole pipeline.
+///
+/// # Cloning
+///
+/// `Cmd: Clone` so you can build a base configuration and branch off
+/// variants. Most state is cheap to clone (owned data or `Arc`). One
+/// caveat: if [`stdin`](Self::stdin) was set with [`StdinData::from_reader`],
+/// the reader is shared across clones — whichever attempt runs first takes
+/// it, and later attempts (or other clones) see no stdin. For bytes-based
+/// stdin, every clone and every retry re-feeds the same buffer.
 #[must_use = "Cmd does nothing until .run() or .spawn() is called"]
 #[derive(Clone)]
 pub struct Cmd {
@@ -578,6 +587,14 @@ impl BitOr for Cmd {
     /// Pipeline composition via `|`. Equivalent to [`Cmd::pipe`].
     fn bitor(self, rhs: Cmd) -> Cmd {
         self.pipe(rhs)
+    }
+}
+
+impl fmt::Display for Cmd {
+    /// Renders the command (or pipeline) shell-style via [`CmdDisplay`],
+    /// respecting `.secret()`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.display().fmt(f)
     }
 }
 
@@ -1224,6 +1241,18 @@ mod tests {
     }
 
     #[test]
+    fn display_on_cmd_matches_cmd_display() {
+        let cmd = Cmd::new("git").args(["log", "-1"]).pipe(Cmd::new("head"));
+        assert_eq!(format!("{cmd}"), "git log -1 | head");
+    }
+
+    #[test]
+    fn display_respects_secret_via_cmd_display() {
+        let cmd = Cmd::new("docker").arg("login").arg("-p").arg("tok").secret();
+        assert_eq!(format!("{cmd}"), "docker <secret>");
+    }
+
+    #[test]
     fn to_commands_returns_all_stages_left_to_right() {
         let cmd = Cmd::new("a").pipe(Cmd::new("b")).pipe(Cmd::new("c"));
         let cmds = cmd.to_commands();
@@ -1244,6 +1273,33 @@ mod tests {
         c2.tree.flatten(&mut s2);
         assert_eq!(s1[0].args, vec![OsString::from("status")]);
         assert_eq!(s2[0].args, vec![OsString::from("log"), OsString::from("-1")]);
+    }
+
+    #[test]
+    fn reader_stdin_shared_across_clones_is_one_shot() {
+        // The reader must only produce data once — whichever attempt takes
+        // it first wins; subsequent clones/retries see no stdin.
+        use std::io::Cursor;
+        let original = Cmd::new("x").stdin(StdinData::from_reader(Cursor::new(b"payload".to_vec())));
+        let clone_a = original.clone();
+        let clone_b = original.clone();
+
+        let a = match clone_a.stdin.as_ref().unwrap() {
+            SharedStdin::Reader(r) => r.clone(),
+            _ => panic!("expected Reader"),
+        };
+        let b = match clone_b.stdin.as_ref().unwrap() {
+            SharedStdin::Reader(r) => r.clone(),
+            _ => panic!("expected Reader"),
+        };
+        // Both clones point at the same Mutex<Option<Reader>>.
+        assert!(Arc::ptr_eq(&a, &b));
+
+        // First take consumes it; second sees None.
+        let first = a.lock().unwrap().take();
+        assert!(first.is_some());
+        let second = b.lock().unwrap().take();
+        assert!(second.is_none());
     }
 
     #[test]
