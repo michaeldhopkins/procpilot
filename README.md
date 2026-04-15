@@ -17,12 +17,13 @@ Built for CLI tools that spawn external processes and need precise failure handl
 - **Stderr routing** — capture / inherit / null / redirect-to-file via [`Redirection`].
 - **Secret redaction** — [`Cmd::secret`] replaces args with `<secret>` in error output and logs.
 - **Streaming / bidirectional** — [`Cmd::spawn`] returns a [`SpawnedProcess`] with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines` for line-by-line callbacks.
+- **Pipelines** — [`Cmd::pipe`] or the `|` operator chains commands (`a | b | c`) with duct-style pipefail status precedence.
 
 ## Usage
 
 ```toml
 [dependencies]
-procpilot = "0.3"
+procpilot = "0.4"
 ```
 
 ```rust
@@ -108,6 +109,28 @@ let manifest = "apiVersion: v1\nkind: ConfigMap\n...";
 Cmd::new("kubectl").args(["apply", "-f", "-"]).stdin(manifest).run()?;
 # Ok::<(), procpilot::RunError>(())
 ```
+
+### Pipelines
+
+Chain commands with [`Cmd::pipe`] or the `|` operator. Per-stage builders (`arg`, `args`, `env`, `in_dir`) target the rightmost stage; pipeline-level knobs (`stdin`, `timeout`, `retry`, `stderr`) apply to the whole thing.
+
+```rust
+use procpilot::Cmd;
+
+let out = Cmd::new("git").args(["log", "--oneline"])
+    .pipe(Cmd::new("grep").arg("feat"))
+    .pipe(Cmd::new("head").arg("-5"))
+    .run()?;
+
+// Same, with `|`:
+let out = (Cmd::new("git").args(["log", "--oneline"])
+    | Cmd::new("grep").arg("feat")
+    | Cmd::new("head").arg("-5"))
+    .run()?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+Failure status follows duct's pipefail rule: any non-success trumps success; the **rightmost** non-success wins. All stages' stderr is captured and concatenated (capture mode) or routed identically (inherit/null/file).
 
 ### Streaming (spawned processes)
 

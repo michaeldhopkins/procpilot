@@ -4,6 +4,23 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-14
+
+### Features
+
+- **Pipelines.** [`Cmd::pipe`] and `impl BitOr` let you build N-ary pipelines: `Cmd::new("a") | Cmd::new("b") | Cmd::new("c")`. Pipelines execute with duct-style pipefail semantics — any non-success trumps success, and the rightmost non-success wins.
+- Per-stage builder methods (`arg`, `args`, `env`, `envs`, `env_remove`, `env_clear`, `in_dir`) target the rightmost stage after `.pipe()`, so you can incrementally build each stage's configuration.
+- Pipeline-level knobs (`stdin`, `stderr`, `timeout`, `deadline`, `retry`, `retry_when`, `secret`, `before_spawn`) apply to the whole pipeline.
+- `CmdDisplay` now renders multi-stage pipelines shell-style (`a | b | c`) and respects `secret` on every stage.
+
+### Implementation
+
+- Uses [`os_pipe`](https://crates.io/crates/os_pipe) 1.2 for clean pipe fd management between stages.
+
+### Limitations
+
+- `Cmd::spawn` on a pipeline returns `RunError::Spawn` with `io::ErrorKind::Unsupported` — pipeline `SpawnedProcess` will land in a later release. Use `.run()` for pipelines.
+
 ## [0.3.0] - 2026-04-14
 
 ### Features

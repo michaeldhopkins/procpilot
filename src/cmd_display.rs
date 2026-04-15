@@ -3,35 +3,49 @@
 //! `CmdDisplay` is what error variants and tracing hooks carry — no lifetime
 //! entanglement with [`Cmd`](crate::Cmd), no references back into a builder.
 //! It implements `Display`, `Debug`, `Clone`, `Send`, `Sync`, `'static`.
+//!
+//! Supports both single commands and pipelines (`a | b | c`); for pipelines
+//! the `Display` impl renders shell-style with ` | ` separators, and
+//! [`program`](CmdDisplay::program) / [`raw_args`](CmdDisplay::raw_args)
+//! return the first stage.
 
 use std::ffi::OsString;
 use std::fmt;
 
-/// Owned snapshot of a command's program + args, formatted shell-style on
-/// `Display`.
-///
-/// If the source [`Cmd`](crate::Cmd) was marked `.secret()`, the args are
-/// replaced with `<secret>` in `Display` output but the field values are
-/// preserved structurally — useful when you want to redact for human-readable
-/// logs but retain raw data for structured (and themselves-redacted)
-/// observability sinks.
-#[derive(Clone)]
-pub struct CmdDisplay {
+/// One stage in a pipeline, or the whole command for a single invocation.
+#[derive(Debug, Clone)]
+pub struct StageDisplay {
     program: OsString,
     args: Vec<OsString>,
+}
+
+impl StageDisplay {
+    pub fn program(&self) -> &OsString {
+        &self.program
+    }
+    pub fn raw_args(&self) -> &[OsString] {
+        &self.args
+    }
+}
+
+/// Owned snapshot of a command's program + args, formatted shell-style on
+/// `Display`. For pipelines, renders each stage separated by ` | `.
+///
+/// If the source [`Cmd`](crate::Cmd) was marked `.secret()`, the args are
+/// replaced with `<secret>` in `Display` output.
+#[derive(Clone)]
+pub struct CmdDisplay {
+    stages: Vec<StageDisplay>,
     secret: bool,
 }
 
 impl fmt::Debug for CmdDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Respect secret flag in Debug too — otherwise `format!("{err:?}")`
-        // leaks redacted args into logs.
         let mut s = f.debug_struct("CmdDisplay");
-        s.field("program", &self.program);
         if self.secret {
-            s.field("args", &"<secret>");
+            s.field("stages", &"<secret>");
         } else {
-            s.field("args", &self.args);
+            s.field("stages", &self.stages);
         }
         s.field("secret", &self.secret).finish()
     }
@@ -40,17 +54,18 @@ impl fmt::Debug for CmdDisplay {
 impl CmdDisplay {
     pub(crate) fn new(program: OsString, args: Vec<OsString>, secret: bool) -> Self {
         Self {
-            program,
-            args,
+            stages: vec![StageDisplay { program, args }],
             secret,
         }
     }
 
-    /// The program name (always shown, even when `secret` is true — only
-    /// args get redacted, on the assumption that the program path itself is
-    /// not sensitive).
+    pub(crate) fn push_stage(&mut self, program: OsString, args: Vec<OsString>) {
+        self.stages.push(StageDisplay { program, args });
+    }
+
+    /// Program name of the first stage (for single commands, the program).
     pub fn program(&self) -> &OsString {
-        &self.program
+        &self.stages[0].program
     }
 
     /// Whether the source `Cmd` was marked secret.
@@ -58,20 +73,35 @@ impl CmdDisplay {
         self.secret
     }
 
-    /// Args, raw. For redacted access, format via `Display`.
+    /// Raw args of the first stage.
     pub fn raw_args(&self) -> &[OsString] {
-        &self.args
+        &self.stages[0].args
+    }
+
+    /// All stages (≥ 1). Length > 1 indicates a pipeline.
+    pub fn stages(&self) -> &[StageDisplay] {
+        &self.stages
+    }
+
+    /// Whether this snapshot represents a multi-stage pipeline.
+    pub fn is_pipeline(&self) -> bool {
+        self.stages.len() > 1
     }
 }
 
 impl fmt::Display for CmdDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", shell_quote_os(&self.program))?;
-        if self.secret {
-            write!(f, " <secret>")?;
-        } else {
-            for arg in &self.args {
-                write!(f, " {}", shell_quote_os(arg))?;
+        for (i, stage) in self.stages.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" | ")?;
+            }
+            write!(f, "{}", shell_quote_os(&stage.program))?;
+            if self.secret {
+                write!(f, " <secret>")?;
+            } else {
+                for arg in &stage.args {
+                    write!(f, " {}", shell_quote_os(arg))?;
+                }
             }
         }
         Ok(())
@@ -99,7 +129,6 @@ fn shell_quote_os(s: &std::ffi::OsStr) -> String {
     out.push('\'');
     for ch in lossy.chars() {
         if ch == '\'' {
-            // close quote, escaped quote, reopen
             out.push_str("'\\''");
         } else {
             out.push(ch);
@@ -125,6 +154,7 @@ mod tests {
     fn simple_command() {
         let d = cd("git", &["status"], false);
         assert_eq!(d.to_string(), "git status");
+        assert!(!d.is_pipeline());
     }
 
     #[test]
@@ -154,7 +184,6 @@ mod tests {
     #[test]
     fn safe_chars_unquoted() {
         let d = cd("git", &["log", "-r", "trunk()..@", "--no-graph"], false);
-        // parens trigger quoting
         assert_eq!(d.to_string(), "git log -r 'trunk()..@' --no-graph");
     }
 
@@ -199,4 +228,26 @@ mod tests {
         assert!(!dbg.contains("hunter2"), "secret leaked in Debug: {dbg}");
         assert!(dbg.contains("<secret>"));
     }
+
+    #[test]
+    fn pipeline_renders_with_separator() {
+        let mut d = cd("git", &["log"], false);
+        d.push_stage("grep".into(), vec!["foo".into()]);
+        d.push_stage("head".into(), vec!["-5".into()]);
+        assert_eq!(d.to_string(), "git log | grep foo | head -5");
+        assert!(d.is_pipeline());
+        assert_eq!(d.stages().len(), 3);
+    }
+
+    #[test]
+    fn pipeline_with_secret_redacts_every_stage() {
+        let mut d = cd("docker", &["login", "-p", "hunter2"], true);
+        d.push_stage("jq".into(), vec![".token".into()]);
+        let rendered = d.to_string();
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains(".token"));
+        assert!(rendered.contains("docker <secret>"));
+        assert!(rendered.contains("jq <secret>"));
+    }
+
 }
