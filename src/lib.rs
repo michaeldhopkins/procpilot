@@ -37,6 +37,8 @@
 //! `procpilot` is aimed at production CLI tools — programs that handle failure
 //! carefully, not scripts that can `panic!` on subprocess weirdness. For
 //! scripting, [`xshell`](https://crates.io/crates/xshell) is the better fit.
+//!
+//! Release history: [CHANGELOG.md](https://github.com/michaeldhopkins/procpilot/blob/main/CHANGELOG.md).
 
 mod error;
 mod runner;

@@ -310,10 +310,26 @@ fn read_to_end<R: Read>(mut reader: R) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    //! Pure-unit tests that don't require mock binaries. Integration tests that
+    //! spawn real processes live in `tests/runner.rs` so they can use
+    //! `env!("CARGO_BIN_EXE_pp_*")` (only set for integration tests).
+
     use super::*;
 
     fn fake_non_zero(stderr: &str) -> RunError {
-        let status = Command::new("false").status().expect("false");
+        // Construct a non-zero ExitStatus without spawning: use platform-specific
+        // conversions via `From`.
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(256) // exit code 1 encoded in high byte
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(1)
+        };
+
         RunError::NonZeroExit {
             program: "program".into(),
             args: vec!["arg".into()],
@@ -330,233 +346,7 @@ mod tests {
         }
     }
 
-    // --- run_cmd_inherited ---
-
-    #[test]
-    fn cmd_inherited_succeeds() {
-        run_cmd_inherited("true", &[]).expect("true should succeed");
-    }
-
-    #[test]
-    fn cmd_inherited_fails_on_nonzero() {
-        let err = run_cmd_inherited("false", &[]).expect_err("should fail");
-        assert!(err.is_non_zero_exit());
-        assert_eq!(err.program(), "false");
-    }
-
-    #[test]
-    fn cmd_inherited_fails_on_missing_binary() {
-        let err = run_cmd_inherited("nonexistent_binary_xyz_42", &[]).expect_err("should fail");
-        assert!(err.is_spawn_failure());
-    }
-
-    // --- run_cmd ---
-
-    #[test]
-    fn cmd_captured_succeeds() {
-        let output = run_cmd("echo", &["hello"]).expect("echo should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "hello");
-    }
-
-    #[test]
-    fn cmd_captured_fails_on_nonzero() {
-        let err = run_cmd("false", &[]).expect_err("should fail");
-        assert!(err.is_non_zero_exit());
-        assert!(err.exit_status().is_some());
-    }
-
-    #[test]
-    fn cmd_captured_captures_stderr_on_failure() {
-        let err = run_cmd("sh", &["-c", "echo err >&2; exit 1"]).expect_err("should fail");
-        assert_eq!(err.stderr(), Some("err\n"));
-    }
-
-    #[test]
-    fn cmd_captured_captures_stdout_on_failure() {
-        let err = run_cmd("sh", &["-c", "echo output; exit 1"]).expect_err("should fail");
-        match &err {
-            RunError::NonZeroExit { stdout, .. } => {
-                assert_eq!(String::from_utf8_lossy(stdout).trim(), "output");
-            }
-            _ => panic!("expected NonZeroExit"),
-        }
-    }
-
-    #[test]
-    fn cmd_fails_on_missing_binary() {
-        let err = run_cmd("nonexistent_binary_xyz_42", &[]).expect_err("should fail");
-        assert!(err.is_spawn_failure());
-    }
-
-    // --- run_cmd_in ---
-
-    #[test]
-    fn cmd_in_runs_in_directory() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = run_cmd_in(tmp.path(), "pwd", &[]).expect("pwd should work");
-        let pwd = output.stdout_lossy().trim().to_string();
-        let expected = tmp.path().canonicalize().expect("canonicalize");
-        let actual = std::path::Path::new(&pwd).canonicalize().expect("canonicalize pwd");
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn cmd_in_fails_on_nonzero() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_cmd_in(tmp.path(), "false", &[]).expect_err("should fail");
-        assert!(err.is_non_zero_exit());
-    }
-
-    #[test]
-    fn cmd_in_fails_on_nonexistent_dir() {
-        let err = run_cmd_in(
-            std::path::Path::new("/nonexistent_dir_xyz_42"),
-            "echo",
-            &["hi"],
-        )
-        .expect_err("should fail");
-        assert!(err.is_spawn_failure());
-    }
-
-    // --- run_cmd_in_with_env ---
-
-    #[test]
-    fn cmd_in_with_env_sets_variable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = run_cmd_in_with_env(
-            tmp.path(),
-            "sh",
-            &["-c", "echo $TEST_VAR_XYZ"],
-            &[("TEST_VAR_XYZ", "hello_from_env")],
-        )
-        .expect("should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "hello_from_env");
-    }
-
-    #[test]
-    fn cmd_in_with_env_multiple_vars() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = run_cmd_in_with_env(
-            tmp.path(),
-            "sh",
-            &["-c", "echo ${A}_${B}"],
-            &[("A", "foo"), ("B", "bar")],
-        )
-        .expect("should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "foo_bar");
-    }
-
-    #[test]
-    fn cmd_in_with_env_overrides_existing_var() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = run_cmd_in_with_env(
-            tmp.path(),
-            "sh",
-            &["-c", "echo $HOME"],
-            &[("HOME", "/fake/home")],
-        )
-        .expect("should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "/fake/home");
-    }
-
-    #[test]
-    fn cmd_in_with_env_fails_on_nonzero() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_cmd_in_with_env(
-            tmp.path(),
-            "sh",
-            &["-c", "exit 1"],
-            &[("IRRELEVANT", "value")],
-        )
-        .expect_err("should fail");
-        assert!(err.is_non_zero_exit());
-    }
-
-    // --- run_cmd_in_with_timeout ---
-
-    #[test]
-    fn timeout_succeeds_for_fast_command() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output =
-            run_cmd_in_with_timeout(tmp.path(), "echo", &["hello"], Duration::from_secs(5))
-                .expect("should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "hello");
-    }
-
-    #[test]
-    fn timeout_fires_for_slow_command() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let wall_start = Instant::now();
-        let err = run_cmd_in_with_timeout(
-            tmp.path(),
-            "sleep",
-            &["10"],
-            Duration::from_millis(200),
-        )
-        .expect_err("should time out");
-        let wall_elapsed = wall_start.elapsed();
-
-        assert!(err.is_timeout());
-        assert!(
-            wall_elapsed < Duration::from_secs(5),
-            "expected quick kill, took {wall_elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn timeout_captures_partial_stderr_before_kill() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_cmd_in_with_timeout(
-            tmp.path(),
-            "sh",
-            &["-c", "echo partial >&2; exec sleep 10"],
-            Duration::from_millis(500),
-        )
-        .expect_err("should time out");
-        assert!(err.is_timeout());
-        let stderr = err.stderr().unwrap_or("");
-        assert!(
-            stderr.contains("partial"),
-            "expected partial stderr, got: {stderr:?}"
-        );
-    }
-
-    #[test]
-    fn timeout_reports_non_zero_exit_when_process_completes() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err =
-            run_cmd_in_with_timeout(tmp.path(), "false", &[], Duration::from_secs(5))
-                .expect_err("should fail");
-        assert!(err.is_non_zero_exit());
-    }
-
-    #[test]
-    fn timeout_fails_on_missing_binary() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_cmd_in_with_timeout(
-            tmp.path(),
-            "nonexistent_binary_xyz_42",
-            &[],
-            Duration::from_secs(5),
-        )
-        .expect_err("should fail");
-        assert!(err.is_spawn_failure());
-    }
-
-    #[test]
-    fn timeout_does_not_block_on_large_output() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let output = run_cmd_in_with_timeout(
-            tmp.path(),
-            "sh",
-            &["-c", "yes | head -c 200000"],
-            Duration::from_secs(5),
-        )
-        .expect("should succeed");
-        assert!(output.stdout.len() >= 200_000);
-    }
-
-    // --- RunOutput ---
+    // --- RunOutput pure-unit tests ---
 
     #[test]
     fn stdout_lossy_valid_utf8() {
@@ -575,7 +365,7 @@ mod tests {
         };
         let s = output.stdout_lossy();
         assert!(s.contains("ab"));
-        assert!(s.contains('�'));
+        assert!(s.contains('\u{FFFD}'));
     }
 
     #[test]
@@ -599,12 +389,7 @@ mod tests {
         assert!(debug.contains("stdout"));
     }
 
-    // --- binary_available / binary_version ---
-
-    #[test]
-    fn binary_available_true_returns_true() {
-        assert!(binary_available("echo"));
-    }
+    // --- binary_available (pure miss case, no binary needed) ---
 
     #[test]
     fn binary_available_missing_returns_false() {
@@ -616,17 +401,7 @@ mod tests {
         assert!(binary_version("nonexistent_binary_xyz_42").is_none());
     }
 
-    // --- check_output ---
-
-    #[test]
-    fn check_output_preserves_stderr_on_success() {
-        let output =
-            run_cmd("sh", &["-c", "echo ok; echo warn >&2"]).expect("should succeed");
-        assert_eq!(output.stdout_lossy().trim(), "ok");
-        assert_eq!(output.stderr.trim(), "warn");
-    }
-
-    // --- retry ---
+    // --- retry predicate ---
 
     #[test]
     fn retry_accepts_closure_over_run_error() {

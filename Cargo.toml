@@ -1,6 +1,6 @@
 [package]
 name = "procpilot"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.91"
 description = "Production-grade subprocess runner with typed errors, retry, and timeout"
@@ -9,7 +9,84 @@ repository = "https://github.com/michaeldhopkins/procpilot"
 homepage = "https://github.com/michaeldhopkins/procpilot"
 readme = "README.md"
 keywords = ["subprocess", "process", "command", "retry", "timeout"]
-categories = ["os", "command-line-interface"]
+categories = ["os", "development-tools"]
+# Dev-only files excluded from the published crate.
+exclude = [
+    "scripts/",
+    ".github/",
+    "CLAUDE.md",
+    "cliff.toml",
+    "clippy.toml",
+    "deny.toml",
+]
+
+[features]
+# Internal feature gating mock test binaries and integration tests. Not
+# intended for downstream consumers. Enabled automatically in CI and when
+# running `cargo test --all-features` locally.
+test-helpers = []
+
+# Mock test binaries. Prefixed `pp_` and gated behind the `test-helpers`
+# feature so they aren't built during `cargo install procpilot`. During
+# `cargo test --all-features`, cargo builds them and sets
+# `CARGO_BIN_EXE_pp_*` so the integration tests can reach them.
+
+[[bin]]
+name = "pp_cat"
+path = "src/bin/pp_cat.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_echo"
+path = "src/bin/pp_echo.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_sleep"
+path = "src/bin/pp_sleep.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_status"
+path = "src/bin/pp_status.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_print_env"
+path = "src/bin/pp_print_env.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_print_env_multi"
+path = "src/bin/pp_print_env_multi.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_pwd"
+path = "src/bin/pp_pwd.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_spam"
+path = "src/bin/pp_spam.rs"
+required-features = ["test-helpers"]
+
+[[bin]]
+name = "pp_child_grandchild"
+path = "src/bin/pp_child_grandchild.rs"
+required-features = ["test-helpers"]
+
+# Integration test that depends on the mock binaries. Skipped when
+# `test-helpers` is off so `cargo test` (without feature flag) still
+# works for unit tests.
+[[test]]
+name = "runner"
+path = "tests/runner.rs"
+required-features = ["test-helpers"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 backon = { version = "1", default-features = false, features = ["std", "std-blocking-sleep"] }
