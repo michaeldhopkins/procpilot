@@ -1,20 +1,24 @@
 //! Production-grade subprocess runner with typed errors, retry, and timeout.
 //!
-//! `procpilot` provides primitives for running external commands from Rust CLI
-//! tools that need to handle failure modes precisely. It distinguishes three
-//! kinds of failure — spawn failure, non-zero exit, and timeout — via a typed
-//! [`RunError`] enum, so callers can treat each appropriately.
+//! `procpilot` provides one entry point — the [`Cmd`] builder — covering every
+//! practical subprocess configuration. Errors are typed: [`RunError`]
+//! distinguishes spawn failure, non-zero exit, and timeout, each carrying
+//! the last 128 KiB of stdout/stderr for diagnosis.
 //!
 //! # Quick start
 //!
 //! ```no_run
-//! use procpilot::{run_cmd, RunError};
+//! use std::time::Duration;
+//! use procpilot::{Cmd, RunError};
 //!
-//! match run_cmd("git", &["show", "maybe-missing-ref"]) {
-//!     Ok(output) => println!("{}", output.stdout_lossy()),
-//!     Err(RunError::NonZeroExit { .. }) => {
-//!         // The command ran and reported failure — a legitimate in-band signal.
-//!     }
+//! let output = Cmd::new("git")
+//!     .args(["show", "maybe-missing-ref"])
+//!     .timeout(Duration::from_secs(30))
+//!     .run();
+//!
+//! match output {
+//!     Ok(o) => println!("{}", o.stdout_lossy()),
+//!     Err(RunError::NonZeroExit { .. }) => { /* ref not found */ }
 //!     Err(e) => return Err(e.into()),
 //! }
 //! # Ok::<(), anyhow::Error>(())
@@ -22,29 +26,32 @@
 //!
 //! # Features
 //!
-//! - **Typed errors**: [`RunError`] distinguishes infrastructure failure (binary
-//!   missing, fork failed), command-level failure (non-zero exit), and timeouts.
-//! - **Retry with backoff**: [`run_with_retry`] for transient error recovery.
-//! - **Timeout with pipe-draining**: [`run_cmd_in_with_timeout`] kills hung
-//!   processes without deadlocking on chatty output.
-//! - **Binary-safe output**: stdout is `Vec<u8>`; [`RunOutput::stdout_lossy`]
-//!   decodes when you want text.
-//! - **Env vars**: [`run_cmd_in_with_env`] for when the child needs extra
-//!   environment variables (e.g., `GIT_INDEX_FILE`).
-//!
-//! # Design
-//!
-//! `procpilot` is aimed at production CLI tools — programs that handle failure
-//! carefully, not scripts that can `panic!` on subprocess weirdness. For
-//! scripting, [`xshell`](https://crates.io/crates/xshell) is the better fit.
+//! - **Typed errors**: [`RunError`] variants for spawn / non-zero / timeout,
+//!   with shell-quoted command display (secret-redacted via [`Cmd::secret`]).
+//! - **Stdin**: [`Cmd::stdin`] accepts owned bytes (reusable across retries)
+//!   or a boxed `Read` (one-shot).
+//! - **Stderr routing**: [`Redirection`] covers capture, inherit, null, and
+//!   file redirection.
+//! - **Timeout + deadline**: [`Cmd::timeout`] for per-attempt, [`Cmd::deadline`]
+//!   for overall wall-clock budget across retries.
+//! - **Retry with exponential backoff**: [`Cmd::retry`] / [`Cmd::retry_when`].
+//! - **Escape hatches**: [`Cmd::before_spawn`] for pre-spawn hooks,
+//!   [`Cmd::to_command`] to drop to raw `std::process::Command`.
 //!
 //! Release history: [CHANGELOG.md](https://github.com/michaeldhopkins/procpilot/blob/main/CHANGELOG.md).
 
+mod cmd;
+mod cmd_display;
 mod error;
+mod redirection;
+mod retry;
 mod runner;
+mod stdin;
 
-pub use error::RunError;
-pub use runner::{
-    RunOutput, binary_available, binary_version, run_cmd, run_cmd_in, run_cmd_in_with_env,
-    run_cmd_in_with_timeout, run_cmd_inherited, run_with_retry,
-};
+pub use cmd::{BeforeSpawnHook, Cmd, RunOutput};
+pub use cmd_display::CmdDisplay;
+pub use error::{RunError, STREAM_SUFFIX_SIZE};
+pub use redirection::Redirection;
+pub use retry::{RetryPolicy, default_transient};
+pub use runner::{binary_available, binary_version};
+pub use stdin::StdinData;
