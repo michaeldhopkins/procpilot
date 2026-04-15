@@ -1,6 +1,6 @@
 [package]
 name = "procpilot"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Production-grade subprocess runner with typed errors, retry, and timeout"
@@ -89,12 +89,18 @@ name = "spawned"
 path = "tests/spawned.rs"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "pipeline"
+path = "tests/pipeline.rs"
+required-features = ["test-helpers"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 backon = { version = "1", default-features = false, features = ["std", "std-blocking-sleep"] }
+os_pipe = "1.2.3"
 shared_child = "1.1.1"
 wait-timeout = "0.2"
 

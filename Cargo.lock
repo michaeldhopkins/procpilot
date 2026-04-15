@@ -182,10 +182,11 @@ dependencies = [
 
 [[package]]
 name = "procpilot"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "backon",
+ "os_pipe",
  "shared_child",
  "tempfile",
  "wait-timeout",

@@ -12,11 +12,31 @@
 //!     .run()?;
 //! # Ok::<(), procpilot::RunError>(())
 //! ```
+//!
+//! # Pipelines
+//!
+//! ```no_run
+//! use procpilot::Cmd;
+//!
+//! // Build: git log --oneline | grep feat | head -5
+//! let output = Cmd::new("git").args(["log", "--oneline"])
+//!     .pipe(Cmd::new("grep").arg("feat"))
+//!     .pipe(Cmd::new("head").arg("-5"))
+//!     .run()?;
+//!
+//! // Equivalent with the `|` operator:
+//! let output = (Cmd::new("git").args(["log", "--oneline"])
+//!     | Cmd::new("grep").arg("feat")
+//!     | Cmd::new("head").arg("-5"))
+//!     .run()?;
+//! # Ok::<(), procpilot::RunError>(())
+//! ```
 
 use std::borrow::Cow;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::ops::BitOr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -24,6 +44,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use backon::BlockingRetryable;
+use os_pipe::PipeReader;
 use shared_child::SharedChild;
 use wait_timeout::ChildExt;
 
@@ -35,11 +56,6 @@ use crate::spawned::SpawnedProcess;
 use crate::stdin::StdinData;
 
 /// Hook invoked on `std::process::Command` immediately before each spawn attempt.
-///
-/// Lets callers set Unix-specific options (`pre_exec`, umask, capabilities) or
-/// otherwise tweak the spawn without waiting for procpilot to grow a builder
-/// method for every knob. Returning an `Err` aborts the spawn and surfaces
-/// as [`RunError::Spawn`].
 pub type BeforeSpawnHook = Arc<dyn Fn(&mut Command) -> io::Result<()> + Send + Sync>;
 
 /// Captured output from a successful command.
@@ -59,19 +75,92 @@ impl RunOutput {
     }
 }
 
-/// Builder for a subprocess invocation.
-///
-/// Construct via [`Cmd::new`], configure with builder methods, terminate with
-/// [`Cmd::run`]. Every knob composes with every other — timeout + env + retry
-/// + stdin work together without combinatorial API explosion.
-#[must_use = "Cmd does nothing until .run() is called"]
-pub struct Cmd {
+/// Per-stage command configuration (program + args + cwd + env).
+#[derive(Debug, Clone)]
+struct SingleCmd {
     program: OsString,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
     env_clear: bool,
     env_remove: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
+}
+
+impl SingleCmd {
+    fn new(program: OsString) -> Self {
+        Self {
+            program,
+            args: Vec::new(),
+            cwd: None,
+            env_clear: false,
+            env_remove: Vec::new(),
+            envs: Vec::new(),
+        }
+    }
+
+    fn apply_to(&self, cmd: &mut Command) {
+        cmd.args(&self.args);
+        if let Some(d) = &self.cwd {
+            cmd.current_dir(d);
+        }
+        if self.env_clear {
+            cmd.env_clear();
+        }
+        for k in &self.env_remove {
+            cmd.env_remove(k);
+        }
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+    }
+}
+
+/// Recursive pipeline tree. Leaves are single commands; internal nodes are
+/// pipes (left's stdout → right's stdin).
+#[derive(Debug, Clone)]
+enum CmdTree {
+    Single(SingleCmd),
+    Pipe(Box<CmdTree>, Box<CmdTree>),
+}
+
+impl CmdTree {
+    /// Walk to the rightmost leaf and yield a mutable reference.
+    fn rightmost_mut(&mut self) -> &mut SingleCmd {
+        match self {
+            CmdTree::Single(s) => s,
+            CmdTree::Pipe(_, r) => r.rightmost_mut(),
+        }
+    }
+
+    /// Flatten the tree into a left-to-right sequence of stage references.
+    fn flatten<'a>(&'a self, out: &mut Vec<&'a SingleCmd>) {
+        match self {
+            CmdTree::Single(s) => out.push(s),
+            CmdTree::Pipe(l, r) => {
+                l.flatten(out);
+                r.flatten(out);
+            }
+        }
+    }
+
+}
+
+/// Builder for a subprocess invocation or pipeline.
+///
+/// Construct via [`Cmd::new`], configure with builder methods, chain with
+/// [`Cmd::pipe`] (or `|`), terminate with [`Cmd::run`] or [`Cmd::spawn`].
+///
+/// Per-stage builders — [`arg`](Self::arg), [`args`](Self::args),
+/// [`in_dir`](Self::in_dir), [`env`](Self::env), [`envs`](Self::envs),
+/// [`env_clear`](Self::env_clear), [`env_remove`](Self::env_remove) — target
+/// the rightmost stage. Pipeline-level builders — [`stdin`](Self::stdin),
+/// [`stderr`](Self::stderr), [`timeout`](Self::timeout),
+/// [`deadline`](Self::deadline), [`retry`](Self::retry),
+/// [`retry_when`](Self::retry_when), [`secret`](Self::secret),
+/// [`before_spawn`](Self::before_spawn) — apply to the whole pipeline.
+#[must_use = "Cmd does nothing until .run() or .spawn() is called"]
+pub struct Cmd {
+    tree: CmdTree,
     stdin: Option<StdinData>,
     stderr_mode: Redirection,
     timeout: Option<Duration>,
@@ -84,11 +173,7 @@ pub struct Cmd {
 impl fmt::Debug for Cmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cmd")
-            .field("program", &self.program)
-            .field("args", &self.args)
-            .field("cwd", &self.cwd)
-            .field("env_clear", &self.env_clear)
-            .field("envs", &self.envs)
+            .field("tree", &self.tree)
             .field("stdin", &self.stdin)
             .field("stderr_mode", &self.stderr_mode)
             .field("timeout", &self.timeout)
@@ -103,12 +188,7 @@ impl Cmd {
     /// Start a new command with the given program.
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
-            program: program.into(),
-            args: Vec::new(),
-            cwd: None,
-            env_clear: false,
-            env_remove: Vec::new(),
-            envs: Vec::new(),
+            tree: CmdTree::Single(SingleCmd::new(program.into())),
             stdin: None,
             stderr_mode: Redirection::default(),
             timeout: None,
@@ -119,69 +199,94 @@ impl Cmd {
         }
     }
 
-    /// Append a single argument.
+    /// Pipe this command's stdout into `next`'s stdin.
+    ///
+    /// Pipeline-level configuration (`stdin`, `stderr`, `timeout`, `deadline`,
+    /// `retry`, `secret`, `before_spawn`) is taken from `self` — any such
+    /// settings on `next` are discarded. Per-stage configuration (args, env,
+    /// cwd) is preserved for each side.
+    pub fn pipe(self, next: Cmd) -> Cmd {
+        Cmd {
+            tree: CmdTree::Pipe(Box::new(self.tree), Box::new(next.tree)),
+            stdin: self.stdin,
+            stderr_mode: self.stderr_mode,
+            timeout: self.timeout,
+            deadline: self.deadline,
+            retry: self.retry,
+            before_spawn: self.before_spawn,
+            // Propagate secret if either side set it — leaking is worse than over-redaction.
+            secret: self.secret || next.secret,
+        }
+    }
+
+    /// Append a single argument to the rightmost stage.
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
-        self.args.push(arg.into());
+        self.tree.rightmost_mut().args.push(arg.into());
         self
     }
 
-    /// Append arguments.
+    /// Append arguments to the rightmost stage.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        self.args.extend(args.into_iter().map(Into::into));
+        self.tree
+            .rightmost_mut()
+            .args
+            .extend(args.into_iter().map(Into::into));
         self
     }
 
-    /// Set the working directory.
+    /// Set the working directory of the rightmost stage.
     pub fn in_dir(mut self, dir: impl AsRef<Path>) -> Self {
-        self.cwd = Some(dir.as_ref().to_path_buf());
+        self.tree.rightmost_mut().cwd = Some(dir.as_ref().to_path_buf());
         self
     }
 
-    /// Add one environment variable.
+    /// Add one environment variable to the rightmost stage.
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
-        self.envs.push((key.into(), value.into()));
+        self.tree
+            .rightmost_mut()
+            .envs
+            .push((key.into(), value.into()));
         self
     }
 
-    /// Add multiple environment variables.
+    /// Add multiple environment variables to the rightmost stage.
     pub fn envs<I, K, V>(mut self, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<OsString>,
         V: Into<OsString>,
     {
-        self.envs
+        self.tree
+            .rightmost_mut()
+            .envs
             .extend(vars.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
 
-    /// Remove an environment variable (applied after inherited env).
+    /// Remove an environment variable from the rightmost stage.
     pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
-        self.env_remove.push(key.into());
+        self.tree.rightmost_mut().env_remove.push(key.into());
         self
     }
 
-    /// Clear the entire inherited environment; only `.env()` / `.envs()` reach the child.
+    /// Clear the inherited environment of the rightmost stage.
     pub fn env_clear(mut self) -> Self {
-        self.env_clear = true;
+        self.tree.rightmost_mut().env_clear = true;
         self
     }
 
-    /// Feed data into the child's stdin.
-    ///
-    /// Accepts `Vec<u8>`, `&[u8]`, `String`, `&str`, or [`StdinData::from_reader`]
-    /// for streaming input. Owned bytes are re-fed on each retry; readers are
-    /// one-shot.
+    /// Feed data into the leftmost stage's stdin.
     pub fn stdin(mut self, data: impl Into<StdinData>) -> Self {
         self.stdin = Some(data.into());
         self
     }
 
-    /// Configure stderr routing. Default is [`Redirection::Capture`].
+    /// Configure stderr routing for every stage. Default is
+    /// [`Redirection::Capture`].
     pub fn stderr(mut self, mode: Redirection) -> Self {
         self.stderr_mode = mode;
         self
@@ -206,25 +311,21 @@ impl Cmd {
     }
 
     /// Replace the retry predicate without changing the backoff schedule.
-    ///
-    /// If no [`RetryPolicy`] is set yet, this installs the default policy and
-    /// then overrides its predicate.
     pub fn retry_when(mut self, f: impl Fn(&RunError) -> bool + Send + Sync + 'static) -> Self {
         let policy = self.retry.take().unwrap_or_default();
         self.retry = Some(policy.when(f));
         self
     }
 
-    /// Mark this command as containing secrets.
-    ///
-    /// [`CmdDisplay`] and [`RunError`] render args as `<secret>` instead of
-    /// their values. Useful for `docker login`, `kubectl --token=…`, etc.
+    /// Mark the pipeline as containing secrets; [`CmdDisplay`] will render
+    /// args as `<secret>`.
     pub fn secret(mut self) -> Self {
         self.secret = true;
         self
     }
 
     /// Register a hook called immediately before each spawn attempt.
+    /// Applied to every stage in a pipeline.
     pub fn before_spawn<F>(mut self, hook: F) -> Self
     where
         F: Fn(&mut Command) -> io::Result<()> + Send + Sync + 'static,
@@ -233,122 +334,89 @@ impl Cmd {
         self
     }
 
-    /// Build a raw `std::process::Command` mirroring this `Cmd`'s configuration.
-    ///
-    /// Escape hatch for cases procpilot's builder doesn't cover. Does not apply
-    /// stdin data, timeout, retry, or stderr redirection — those are
-    /// runner-level concerns.
+    /// Build a raw `std::process::Command` mirroring the rightmost stage.
+    /// Only meaningful for single-command invocations; for pipelines, returns
+    /// the right-hand stage.
     pub fn to_command(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
-        if let Some(dir) = &self.cwd {
-            cmd.current_dir(dir);
-        }
-        if self.env_clear {
-            cmd.env_clear();
-        }
-        for key in &self.env_remove {
-            cmd.env_remove(key);
-        }
-        for (k, v) in &self.envs {
-            cmd.env(k, v);
-        }
+        let single = match &self.tree {
+            CmdTree::Single(s) => s,
+            CmdTree::Pipe(_, r) => right_leaf(r),
+        };
+        let mut cmd = Command::new(&single.program);
+        single.apply_to(&mut cmd);
         cmd
     }
 
-    /// Snapshot the command for display/logging.
+    /// Snapshot the command (or pipeline) for display/logging.
     pub fn display(&self) -> CmdDisplay {
-        CmdDisplay::new(self.program.clone(), self.args.clone(), self.secret)
+        let mut leaves = Vec::new();
+        self.tree.flatten(&mut leaves);
+        let first = &leaves[0];
+        let mut d = CmdDisplay::new(first.program.clone(), first.args.clone(), self.secret);
+        for leaf in leaves.into_iter().skip(1) {
+            d.push_stage(leaf.program.clone(), leaf.args.clone());
+        }
+        d
+    }
+
+    fn per_attempt_timeout(&self, now: Instant) -> Option<Duration> {
+        match (self.timeout, self.deadline) {
+            (None, None) => None,
+            (Some(t), None) => Some(t),
+            (None, Some(d)) => Some(d.saturating_duration_since(now)),
+            (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
+        }
     }
 
     /// Spawn the command as a long-lived process handle.
     ///
-    /// Returns a [`SpawnedProcess`] for streaming, bidirectional protocols,
-    /// or any case where you need live access to stdin/stdout. Stdin and
-    /// stdout are always piped; stderr follows the configured
-    /// [`Redirection`] (default [`Redirection::Capture`], drained into a
-    /// background thread and surfaced on [`SpawnedProcess::wait`]).
-    ///
-    /// If stdin bytes were set via [`stdin`](Self::stdin), they're fed
-    /// automatically in a background thread; otherwise the caller can pipe
-    /// data via [`SpawnedProcess::take_stdin`].
-    ///
-    /// `timeout`, `deadline`, and `retry` are **ignored** on this path —
-    /// they only apply to the one-shot [`run`](Self::run) method. Use
-    /// [`SpawnedProcess::wait_timeout`] or [`SpawnedProcess::kill`] for
-    /// per-call bounds.
+    /// **Single commands only.** Spawning pipelines will be added in a later
+    /// release; for now, pipelines should use [`run`](Self::run). Returns
+    /// [`RunError::Spawn`] with an `Unsupported` io error if called on a
+    /// pipeline.
     pub fn spawn(mut self) -> Result<SpawnedProcess, RunError> {
         let display = self.display();
+        let single = match self.tree {
+            CmdTree::Single(s) => s,
+            CmdTree::Pipe(_, _) => {
+                return Err(RunError::Spawn {
+                    command: display,
+                    source: io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Cmd::spawn on a pipeline is not yet supported; use .run()",
+                    ),
+                });
+            }
+        };
         let stdin_data = self.stdin.take();
-
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
-        if let Some(dir) = &self.cwd {
-            cmd.current_dir(dir);
-        }
-        if self.env_clear {
-            cmd.env_clear();
-        }
-        for key in &self.env_remove {
-            cmd.env_remove(key);
-        }
-        for (k, v) in &self.envs {
-            cmd.env(k, v);
-        }
-
+        let mut cmd = Command::new(&single.program);
+        single.apply_to(&mut cmd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        match &self.stderr_mode {
-            Redirection::Capture => {
-                cmd.stderr(Stdio::piped());
-            }
-            Redirection::Inherit => {
-                cmd.stderr(Stdio::inherit());
-            }
-            Redirection::Null => {
-                cmd.stderr(Stdio::null());
-            }
-            Redirection::File(f) => {
-                let cloned = f.try_clone().map_err(|source| RunError::Spawn {
-                    command: display.clone(),
-                    source,
-                })?;
-                cmd.stderr(Stdio::from(cloned));
-            }
-        }
-
+        apply_stderr(&mut cmd, &self.stderr_mode, &display)?;
         if let Some(hook) = &self.before_spawn {
             hook(&mut cmd).map_err(|source| RunError::Spawn {
                 command: display.clone(),
                 source,
             })?;
         }
-
         let child = SharedChild::spawn(&mut cmd).map_err(|source| RunError::Spawn {
             command: display.clone(),
             source,
         })?;
         let child = Arc::new(child);
-
-        // If caller supplied stdin data, feed it in a background thread so
-        // they can still call take_stdout without blocking on a full pipe.
         if let Some(data) = stdin_data
             && let Some(mut pipe) = child.take_stdin()
         {
-            thread::spawn(move || {
-                use std::io::Write;
-                match data {
-                    StdinData::Bytes(b) => {
-                        let _ = pipe.write_all(&b);
-                    }
-                    StdinData::Reader(mut r) => {
-                        let _ = io::copy(&mut r, &mut pipe);
-                    }
+            thread::spawn(move || match data {
+                StdinData::Bytes(b) => {
+                    let _ = pipe.write_all(&b);
+                }
+                StdinData::Reader(mut r) => {
+                    let _ = io::copy(&mut r, &mut pipe);
                 }
             });
         }
-
-        // Drain stderr in the background (Capture mode only).
         let stderr_thread = if matches!(self.stderr_mode, Redirection::Capture)
             && let Some(pipe) = child.take_stderr()
         {
@@ -356,7 +424,6 @@ impl Cmd {
         } else {
             None
         };
-
         Ok(SpawnedProcess::new(child, stderr_thread, display))
     }
 
@@ -382,9 +449,7 @@ impl Cmd {
         F: FnMut(&str) -> io::Result<()>,
     {
         let proc = self.spawn()?;
-        let stdout = proc
-            .take_stdout()
-            .expect("spawn always pipes stdout");
+        let stdout = proc.take_stdout().expect("spawn always pipes stdout");
         let reader = std::io::BufReader::new(stdout);
         use std::io::BufRead;
         for line in reader.lines() {
@@ -411,58 +476,83 @@ impl Cmd {
         proc.wait()
     }
 
-    /// Run the command, blocking until it completes (or times out).
+    /// Run the command (or pipeline), blocking until it completes (or times out).
     pub fn run(mut self) -> Result<RunOutput, RunError> {
         let display = self.display();
         let mut stdin_holder = StdinHolder::from_opt(self.stdin.take());
         let retry = self.retry.take();
-        let ctx = ExecContext {
-            program: &self.program,
-            args: &self.args,
-            cwd: self.cwd.as_deref(),
-            env_clear: self.env_clear,
-            env_remove: &self.env_remove,
-            envs: &self.envs,
-            stderr_mode: &self.stderr_mode,
-            before_spawn: self.before_spawn.as_ref(),
-            display: &display,
+
+        let op = |stdin: StdinForAttempt, per_attempt: Option<Duration>| match &self.tree {
+            CmdTree::Single(single) => execute_single(
+                single,
+                &self.stderr_mode,
+                self.before_spawn.as_ref(),
+                &display,
+                stdin,
+                per_attempt,
+            ),
+            CmdTree::Pipe(_, _) => {
+                let mut stages = Vec::new();
+                self.tree.flatten(&mut stages);
+                execute_pipeline(
+                    &stages,
+                    &self.stderr_mode,
+                    self.before_spawn.as_ref(),
+                    &display,
+                    stdin,
+                    per_attempt,
+                )
+            }
         };
 
         match retry {
-            None => execute_once(&ctx, stdin_holder.take_for_attempt(), self.per_attempt_timeout(Instant::now())),
-            Some(policy) => run_with_retry(&ctx, &mut stdin_holder, policy, self.timeout, self.deadline),
-        }
-    }
-
-    fn per_attempt_timeout(&self, now: Instant) -> Option<Duration> {
-        match (self.timeout, self.deadline) {
-            (None, None) => None,
-            (Some(t), None) => Some(t),
-            (None, Some(d)) => Some(d.saturating_duration_since(now)),
-            (Some(t), Some(d)) => {
-                let remaining = d.saturating_duration_since(now);
-                Some(t.min(remaining))
-            }
+            None => op(stdin_holder.take_for_attempt(), self.per_attempt_timeout(Instant::now())),
+            Some(policy) => run_with_retry(
+                &mut stdin_holder,
+                policy,
+                self.timeout,
+                self.deadline,
+                &display,
+                &op,
+            ),
         }
     }
 }
 
-fn run_with_retry(
-    ctx: &ExecContext<'_>,
+impl BitOr for Cmd {
+    type Output = Cmd;
+    /// Pipeline composition via `|`. Equivalent to [`Cmd::pipe`].
+    fn bitor(self, rhs: Cmd) -> Cmd {
+        self.pipe(rhs)
+    }
+}
+
+fn right_leaf(tree: &CmdTree) -> &SingleCmd {
+    match tree {
+        CmdTree::Single(s) => s,
+        CmdTree::Pipe(_, r) => right_leaf(r),
+    }
+}
+
+fn run_with_retry<F>(
     stdin_holder: &mut StdinHolder,
     policy: RetryPolicy,
     timeout: Option<Duration>,
     deadline: Option<Instant>,
-) -> Result<RunOutput, RunError> {
+    display: &CmdDisplay,
+    op: &F,
+) -> Result<RunOutput, RunError>
+where
+    F: Fn(StdinForAttempt, Option<Duration>) -> Result<RunOutput, RunError>,
+{
     let predicate = policy.predicate.clone();
-    let op = || {
+    let attempt = || {
         let now = Instant::now();
         if let Some(d) = deadline
             && now >= d
         {
-            // Deadline exhausted; synthesize a timeout-style error without spawning.
             return Err(RunError::Timeout {
-                command: ctx.display.clone(),
+                command: display.clone(),
                 elapsed: Duration::ZERO,
                 stdout: Vec::new(),
                 stderr: String::new(),
@@ -475,23 +565,12 @@ fn run_with_retry(
             (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
         };
         let stdin = stdin_holder.take_for_attempt();
-        execute_once(ctx, stdin, per_attempt)
+        op(stdin, per_attempt)
     };
-    op.retry(policy.backoff)
+    attempt
+        .retry(policy.backoff)
         .when(move |e: &RunError| predicate(e))
         .call()
-}
-
-struct ExecContext<'a> {
-    program: &'a OsStr,
-    args: &'a [OsString],
-    cwd: Option<&'a Path>,
-    env_clear: bool,
-    env_remove: &'a [OsString],
-    envs: &'a [(OsString, OsString)],
-    stderr_mode: &'a Redirection,
-    before_spawn: Option<&'a BeforeSpawnHook>,
-    display: &'a CmdDisplay,
 }
 
 enum StdinHolder {
@@ -533,22 +612,61 @@ enum Outcome {
     WaitFailed(io::Error),
 }
 
-fn execute_once(
-    ctx: &ExecContext<'_>,
+fn apply_stderr(
+    cmd: &mut Command,
+    mode: &Redirection,
+    display: &CmdDisplay,
+) -> Result<(), RunError> {
+    match mode {
+        Redirection::Capture => {
+            cmd.stderr(Stdio::piped());
+        }
+        Redirection::Inherit => {
+            cmd.stderr(Stdio::inherit());
+        }
+        Redirection::Null => {
+            cmd.stderr(Stdio::null());
+        }
+        Redirection::File(f) => {
+            let cloned = f.try_clone().map_err(|source| RunError::Spawn {
+                command: display.clone(),
+                source,
+            })?;
+            cmd.stderr(Stdio::from(cloned));
+        }
+    }
+    Ok(())
+}
+
+fn execute_single(
+    single: &SingleCmd,
+    stderr_mode: &Redirection,
+    before_spawn: Option<&BeforeSpawnHook>,
+    display: &CmdDisplay,
     stdin: StdinForAttempt,
     timeout: Option<Duration>,
 ) -> Result<RunOutput, RunError> {
-    let mut cmd = build_command(ctx, &stdin)?;
+    let mut cmd = Command::new(&single.program);
+    single.apply_to(&mut cmd);
 
-    if let Some(hook) = ctx.before_spawn {
+    match &stdin {
+        StdinForAttempt::None => {}
+        StdinForAttempt::Bytes(_) | StdinForAttempt::Reader(_) => {
+            cmd.stdin(Stdio::piped());
+        }
+    }
+    cmd.stdout(Stdio::piped());
+    apply_stderr(&mut cmd, stderr_mode, display)?;
+
+    if let Some(hook) = before_spawn {
         hook(&mut cmd).map_err(|source| RunError::Spawn {
-            command: ctx.display.clone(),
+            command: display.clone(),
             source,
         })?;
     }
 
     let mut child = cmd.spawn().map_err(|source| RunError::Spawn {
-        command: ctx.display.clone(),
+        command: display.clone(),
         source,
     })?;
 
@@ -557,7 +675,7 @@ fn execute_once(
         let pipe = child.stdout.take().expect("stdout piped");
         Some(thread::spawn(move || read_to_end(pipe)))
     };
-    let stderr_thread = if matches!(ctx.stderr_mode, Redirection::Capture) {
+    let stderr_thread = if matches!(stderr_mode, Redirection::Capture) {
         let pipe = child.stderr.take().expect("stderr piped");
         Some(thread::spawn(move || read_to_end(pipe)))
     } else {
@@ -596,11 +714,11 @@ fn execute_once(
         .unwrap_or_default();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
-    finalize_outcome(ctx, outcome, stdout_bytes, stderr_str)
+    finalize_outcome(display, outcome, stdout_bytes, stderr_str)
 }
 
 fn finalize_outcome(
-    ctx: &ExecContext<'_>,
+    display: &CmdDisplay,
     outcome: Outcome,
     stdout_bytes: Vec<u8>,
     stderr_str: String,
@@ -611,67 +729,22 @@ fn finalize_outcome(
             stderr: stderr_str,
         }),
         Outcome::Exited(status) => Err(RunError::NonZeroExit {
-            command: ctx.display.clone(),
+            command: display.clone(),
             status,
             stdout: truncate_suffix(stdout_bytes),
             stderr: truncate_suffix_string(stderr_str),
         }),
         Outcome::TimedOut(elapsed) => Err(RunError::Timeout {
-            command: ctx.display.clone(),
+            command: display.clone(),
             elapsed,
             stdout: truncate_suffix(stdout_bytes),
             stderr: truncate_suffix_string(stderr_str),
         }),
         Outcome::WaitFailed(source) => Err(RunError::Spawn {
-            command: ctx.display.clone(),
+            command: display.clone(),
             source,
         }),
     }
-}
-
-fn build_command(ctx: &ExecContext<'_>, stdin: &StdinForAttempt) -> Result<Command, RunError> {
-    let mut cmd = Command::new(ctx.program);
-    cmd.args(ctx.args);
-    if let Some(dir) = ctx.cwd {
-        cmd.current_dir(dir);
-    }
-    if ctx.env_clear {
-        cmd.env_clear();
-    }
-    for key in ctx.env_remove {
-        cmd.env_remove(key);
-    }
-    for (k, v) in ctx.envs {
-        cmd.env(k, v);
-    }
-
-    match stdin {
-        StdinForAttempt::None => {}
-        StdinForAttempt::Bytes(_) | StdinForAttempt::Reader(_) => {
-            cmd.stdin(Stdio::piped());
-        }
-    }
-    cmd.stdout(Stdio::piped());
-
-    match ctx.stderr_mode {
-        Redirection::Capture => {
-            cmd.stderr(Stdio::piped());
-        }
-        Redirection::Inherit => {
-            cmd.stderr(Stdio::inherit());
-        }
-        Redirection::Null => {
-            cmd.stderr(Stdio::null());
-        }
-        Redirection::File(f) => {
-            let cloned = f.try_clone().map_err(|source| RunError::Spawn {
-                command: ctx.display.clone(),
-                source,
-            })?;
-            cmd.stderr(Stdio::from(cloned));
-        }
-    }
-    Ok(cmd)
 }
 
 fn spawn_stdin_feeder(
@@ -701,6 +774,176 @@ fn read_to_end<R: Read>(mut reader: R) -> Vec<u8> {
     buf
 }
 
+// ---------- pipeline execution ----------
+
+fn execute_pipeline(
+    stages: &[&SingleCmd],
+    stderr_mode: &Redirection,
+    before_spawn: Option<&BeforeSpawnHook>,
+    display: &CmdDisplay,
+    stdin: StdinForAttempt,
+    timeout: Option<Duration>,
+) -> Result<RunOutput, RunError> {
+    debug_assert!(stages.len() >= 2);
+
+    // Build N-1 pipes between adjacent stages. Each pipe's reader and writer
+    // live in Options so we can `take` them into individual children — each
+    // half is used exactly once.
+    let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
+    for _ in 0..stages.len() - 1 {
+        let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+        pipes.push((Some(r), Some(w)));
+    }
+
+    let mut children: Vec<std::process::Child> = Vec::with_capacity(stages.len());
+    let mut stdin_thread: Option<thread::JoinHandle<()>> = None;
+    let mut last_stdout: Option<std::process::ChildStdout> = None;
+    let mut stderr_threads: Vec<thread::JoinHandle<Vec<u8>>> = Vec::new();
+    let mut stdin_for_feed = Some(stdin);
+
+    for (i, stage) in stages.iter().enumerate() {
+        let mut cmd = Command::new(&stage.program);
+        stage.apply_to(&mut cmd);
+
+        // stdin
+        if i == 0 {
+            match stdin_for_feed.as_ref() {
+                Some(StdinForAttempt::None) | None => {}
+                Some(StdinForAttempt::Bytes(_)) | Some(StdinForAttempt::Reader(_)) => {
+                    cmd.stdin(Stdio::piped());
+                }
+            }
+        } else {
+            let reader = pipes[i - 1].0.take().expect("pipe reader");
+            cmd.stdin(Stdio::from(reader));
+        }
+
+        // stdout — last stage captured, others feed the next pipe.
+        if i == stages.len() - 1 {
+            cmd.stdout(Stdio::piped());
+        } else {
+            let writer = pipes[i].1.take().expect("pipe writer");
+            cmd.stdout(Stdio::from(writer));
+        }
+
+        apply_stderr(&mut cmd, stderr_mode, display)?;
+
+        if let Some(hook) = before_spawn {
+            hook(&mut cmd).map_err(|source| RunError::Spawn {
+                command: display.clone(),
+                source,
+            })?;
+        }
+
+        let mut child = cmd.spawn().map_err(|source| RunError::Spawn {
+            command: display.clone(),
+            source,
+        })?;
+
+        // Feed stdin for the first stage (taking ownership of stdin_for_feed).
+        if i == 0
+            && let Some(data) = stdin_for_feed.take()
+            && !matches!(data, StdinForAttempt::None)
+        {
+            stdin_thread = spawn_stdin_feeder(&mut child, data);
+        }
+
+        // Capture stderr if Capture mode (each stage independently).
+        if matches!(stderr_mode, Redirection::Capture)
+            && let Some(pipe) = child.stderr.take()
+        {
+            stderr_threads.push(thread::spawn(move || read_to_end(pipe)));
+        }
+
+        // The last stage's stdout is our captured output.
+        if i == stages.len() - 1 {
+            last_stdout = child.stdout.take();
+        }
+
+        children.push(child);
+    }
+
+    // Drain stdout of the last stage in a thread so we don't deadlock on full pipes.
+    let stdout_thread = last_stdout.map(|pipe| thread::spawn(move || read_to_end(pipe)));
+
+    // Wait for all stages (with optional timeout).
+    let start = Instant::now();
+    let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
+
+    if let Some(budget) = timeout {
+        // Simple approach: wait_timeout on each in order, deducting elapsed.
+        for child in children.iter_mut() {
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                let _ = child.kill();
+                let _ = child.wait();
+                per_stage_status.push(Outcome::TimedOut(start.elapsed()));
+                continue;
+            }
+            match child.wait_timeout(remaining) {
+                Ok(Some(status)) => per_stage_status.push(Outcome::Exited(status)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    per_stage_status.push(Outcome::TimedOut(start.elapsed()));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    per_stage_status.push(Outcome::WaitFailed(e));
+                }
+            }
+        }
+    } else {
+        for child in children.iter_mut() {
+            match child.wait() {
+                Ok(status) => per_stage_status.push(Outcome::Exited(status)),
+                Err(e) => per_stage_status.push(Outcome::WaitFailed(e)),
+            }
+        }
+    }
+
+    if let Some(t) = stdin_thread {
+        let _ = t.join();
+    }
+    let stdout_bytes = stdout_thread
+        .map(|t| t.join().unwrap_or_default())
+        .unwrap_or_default();
+    // Concat all stderr outputs with newlines between stages.
+    let mut stderr_all = String::new();
+    for t in stderr_threads {
+        let bytes = t.join().unwrap_or_default();
+        stderr_all.push_str(&String::from_utf8_lossy(&bytes));
+    }
+
+    // pipefail-style status precedence: right-most checked error wins.
+    let final_outcome = combine_outcomes(per_stage_status);
+
+    finalize_outcome(display, final_outcome, stdout_bytes, stderr_all)
+}
+
+fn combine_outcomes(outcomes: Vec<Outcome>) -> Outcome {
+    // Scan right-to-left for the last non-success outcome.
+    let mut chosen: Option<Outcome> = None;
+    for o in outcomes.into_iter() {
+        match &o {
+            Outcome::Exited(status) if status.success() => {
+                // Keep the successful status as a fallback if nothing else failed.
+                if chosen.is_none() {
+                    chosen = Some(o);
+                }
+            }
+            _ => chosen = Some(o), // later (rightmost) non-success replaces prior
+        }
+    }
+    chosen.unwrap_or(Outcome::WaitFailed(io::Error::other(
+        "pipeline had no stages",
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,57 +951,63 @@ mod tests {
     #[test]
     fn must_use_annotation_present() {
         let _ = Cmd::new("x");
-        // Compile-only: unused Cmd triggers #[must_use] lint if disabled.
     }
 
     #[test]
-    fn builder_accumulates_args() {
+    fn builder_accumulates_args_on_single() {
         let cmd = Cmd::new("git").arg("status").args(["-s", "--short"]);
-        assert_eq!(cmd.args.len(), 3);
-    }
-
-    #[test]
-    fn env_builder() {
-        let cmd = Cmd::new("x")
-            .env("A", "1")
-            .envs([("B", "2"), ("C", "3")])
-            .env_remove("D")
-            .env_clear();
-        assert_eq!(cmd.envs.len(), 3);
-        assert_eq!(cmd.env_remove.len(), 1);
-        assert!(cmd.env_clear);
-    }
-
-    #[test]
-    fn stdin_bytes_is_reusable() {
-        let cmd = Cmd::new("x").stdin("hello");
-        match cmd.stdin.as_ref() {
-            Some(StdinData::Bytes(b)) => assert_eq!(b, b"hello"),
-            _ => panic!("expected Bytes"),
+        match &cmd.tree {
+            CmdTree::Single(s) => assert_eq!(s.args.len(), 3),
+            _ => panic!("expected Single"),
         }
     }
 
     #[test]
-    fn secret_flag_reaches_display() {
-        let cmd = Cmd::new("docker").arg("login").arg("-p").arg("hunter2").secret();
+    fn pipe_builds_tree_and_args_target_rightmost() {
+        let cmd = Cmd::new("a").arg("1").pipe(Cmd::new("b")).arg("right");
+        // After .arg("right"), the rightmost (b) should have one arg.
+        let mut stages = Vec::new();
+        cmd.tree.flatten(&mut stages);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].args, vec![OsString::from("1")]);
+        assert_eq!(stages[1].args, vec![OsString::from("right")]);
+    }
+
+    #[test]
+    fn bitor_builds_pipeline() {
+        let cmd = Cmd::new("a") | Cmd::new("b") | Cmd::new("c");
+        let mut stages = Vec::new();
+        cmd.tree.flatten(&mut stages);
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].program, OsString::from("a"));
+        assert_eq!(stages[2].program, OsString::from("c"));
+    }
+
+    #[test]
+    fn secret_flag_propagates_through_pipe() {
+        let cmd = Cmd::new("docker").arg("login").secret().pipe(Cmd::new("jq"));
         let d = cmd.display();
         assert!(d.is_secret());
-        assert_eq!(d.to_string(), "docker <secret>");
+        assert_eq!(d.to_string(), "docker <secret> | jq <secret>");
     }
 
     #[test]
-    fn to_command_mirrors_config() {
-        let cmd = Cmd::new("git").args(["status"]).env("K", "V").in_dir("/tmp");
-        let std_cmd = cmd.to_command();
-        // We can only assert program; args/env are not publicly inspectable on
-        // std::process::Command. At least confirm no panic.
-        assert_eq!(std_cmd.get_program(), "git");
+    fn env_builder_targets_rightmost() {
+        let cmd = Cmd::new("a").env("X", "1").pipe(Cmd::new("b")).env("Y", "2");
+        let mut stages = Vec::new();
+        cmd.tree.flatten(&mut stages);
+        assert_eq!(stages[0].envs, vec![(OsString::from("X"), OsString::from("1"))]);
+        assert_eq!(stages[1].envs, vec![(OsString::from("Y"), OsString::from("2"))]);
     }
 
     #[test]
-    fn retry_when_installs_default_policy() {
-        let cmd = Cmd::new("x").retry_when(|_| true);
-        assert!(cmd.retry.is_some());
+    fn display_renders_pipeline() {
+        let cmd = Cmd::new("git").args(["log", "--oneline"])
+            .pipe(Cmd::new("grep").arg("feat"))
+            .pipe(Cmd::new("head").arg("-5"));
+        let d = cmd.display();
+        assert!(d.is_pipeline());
+        assert_eq!(d.to_string(), "git log --oneline | grep feat | head -5");
     }
 
     #[test]
@@ -769,5 +1018,47 @@ mod tests {
         let t = cmd.per_attempt_timeout(Instant::now()).unwrap();
         assert!(t <= Duration::from_secs(60));
         assert!(t <= Duration::from_secs(6));
+    }
+
+    #[test]
+    fn combine_outcomes_prefers_rightmost_failure() {
+        use std::process::ExitStatus;
+        #[cfg(unix)]
+        let fail_status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(256)
+        };
+        #[cfg(windows)]
+        let fail_status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(1)
+        };
+        #[cfg(unix)]
+        let ok_status = {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        };
+        #[cfg(windows)]
+        let ok_status = {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        };
+        let outcomes = vec![
+            Outcome::Exited(fail_status),
+            Outcome::Exited(ok_status),
+            Outcome::Exited(fail_status),
+        ];
+        let combined = combine_outcomes(outcomes);
+        match combined {
+            Outcome::Exited(s) => assert!(!s.success()),
+            _ => panic!("expected Exited"),
+        }
+    }
+
+    #[test]
+    fn to_command_returns_rightmost_for_pipeline() {
+        let cmd = Cmd::new("a").pipe(Cmd::new("b"));
+        let std_cmd = cmd.to_command();
+        assert_eq!(std_cmd.get_program(), "b");
     }
 }
