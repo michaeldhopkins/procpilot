@@ -16,14 +16,27 @@ Built for CLI tools that spawn external processes and need precise failure handl
 - **Stdin piping** — owned bytes (reusable across retries) or a boxed `Read` (one-shot streaming).
 - **Stderr routing** — capture / inherit / null / redirect-to-file via [`Redirection`].
 - **Secret redaction** — [`Cmd::secret`] replaces args with `<secret>` in error output and logs.
-- **Streaming / bidirectional** — [`Cmd::spawn`] returns a [`SpawnedProcess`] with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines` for line-by-line callbacks.
-- **Pipelines** — [`Cmd::pipe`] or the `|` operator chains commands (`a | b | c`) with duct-style pipefail status precedence.
+- **Streaming / bidirectional** — [`Cmd::spawn`] returns a [`SpawnedProcess`] (single command or pipeline) with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines` for line-by-line callbacks.
+- **Pipelines** — [`Cmd::pipe`] or the `|` operator chains commands (`a | b | c`) with duct-style pipefail status precedence. `Cmd::run()` and `Cmd::spawn()` both work on pipelines.
+- **Cloneable `Cmd`** — configure a base `Cmd` once, clone it to branch off variants. Bytes-stdin and file handles are `Arc`-shared across clones; reader-stdin is one-shot.
+- **`impl Display for Cmd`** — `format!("{cmd}")` renders shell-style with secret redaction.
 
 ## Usage
 
 ```toml
 [dependencies]
 procpilot = "0.5"
+```
+
+### Reusing a base `Cmd`
+
+```rust
+use procpilot::Cmd;
+
+let base = Cmd::new("git").in_dir("/repo").env("GIT_TERMINAL_PROMPT", "0");
+let status = base.clone().args(["status", "--short"]).run()?;
+let log    = base.clone().args(["log", "-1", "--oneline"]).run()?;
+# Ok::<(), procpilot::RunError>(())
 ```
 
 ```rust

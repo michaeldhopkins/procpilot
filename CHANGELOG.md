@@ -4,6 +4,20 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-04-14
+
+### Features
+
+- `impl fmt::Display for Cmd` — `format!("{cmd}")` now works directly, delegating to `CmdDisplay` (shell-quoted, secret-respecting).
+
+### Docs
+
+- Document that cloning a `Cmd` with a reader-based stdin produces a one-shot Mutex: whichever attempt runs first takes the reader, later clones/retries see no stdin. Bytes-based stdin is shared via `Arc` and re-feeds on every attempt.
+
+### Tests
+
+- Added coverage of the reader-stdin one-shot invariant across clones.
+
 ## [0.5.0] - 2026-04-14
 
 ### Breaking changes
