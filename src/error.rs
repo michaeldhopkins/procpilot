@@ -340,7 +340,6 @@ mod tests {
             .collect();
         let truncated = truncate_suffix(big.clone());
         assert_eq!(truncated.len(), STREAM_SUFFIX_SIZE);
-        // Last byte preserved
         assert_eq!(truncated.last(), big.last());
     }
 

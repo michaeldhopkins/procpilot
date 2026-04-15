@@ -4,6 +4,17 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-04-14
+
+### Features
+
+- **`Cmd::spawn` now supports pipelines.** The returned [`SpawnedProcess`] holds every stage's `SharedChild`; `take_stdin` targets the leftmost stage, `take_stdout` the rightmost, and `kill` / `wait` / `try_wait` / `wait_timeout` operate on every stage. Status follows the same pipefail rule as `.run()`.
+- `SpawnedProcess::is_pipeline()` and `pids()` (length > 1) expose the multi-stage shape.
+
+### Internal
+
+- Comment pass: removed dozens of "what" comments that restated the code; kept only "why" (non-obvious invariants, workarounds, intent of a test).
+
 ## [0.4.0] - 2026-04-14
 
 ### Features
