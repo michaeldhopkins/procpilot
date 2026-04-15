@@ -85,6 +85,11 @@ impl RunError {
     }
 
     /// The captured stderr suffix, if any. None for spawn failures.
+    ///
+    /// Stderr is stored after lossy UTF-8 decoding — any invalid sequences
+    /// from the child appear as U+FFFD replacement characters. Callers that
+    /// truly need raw bytes should inspect the child's stderr directly via
+    /// [`Cmd::spawn`](crate::Cmd::spawn).
     pub fn stderr(&self) -> Option<&str> {
         match self {
             Self::NonZeroExit { stderr, .. } => Some(stderr),

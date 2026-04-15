@@ -23,7 +23,7 @@ Built for CLI tools that spawn external processes and need precise failure handl
 
 ```toml
 [dependencies]
-procpilot = "0.4"
+procpilot = "0.5"
 ```
 
 ```rust

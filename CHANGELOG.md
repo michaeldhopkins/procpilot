@@ -4,6 +4,21 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-14
+
+### Breaking changes
+
+- **`Redirection::File(File)` → `Redirection::File(Arc<File>)`.** Enables [`Cmd`] to be `Clone` without losing the file handle. Migration: wrap the `File` in `Arc::new(...)` at the call site.
+
+### Features
+
+- **`Cmd` now implements `Clone`.** Template-and-vary is now ergonomic: configure a base `Cmd`, clone to branch off variants. Internally, stdin data is `Arc`-shared — `Bytes` variants share the same buffer across clones (cheap), and `Reader` variants share a `Mutex<Option<…>>` so the first attempt to run takes the reader and subsequent clones or retries see no stdin. All other fields (program, args, envs, retry policy, before_spawn hook, stderr mode) clone cheaply via `Arc` or owned data.
+- **`Cmd::to_commands()`** — returns one `std::process::Command` per pipeline stage, leftmost first. Complements `to_command()` (which for pipelines returns only the rightmost stage, now clearly documented).
+
+### Docs
+
+- `RunError::stderr` doc comment now calls out that the value is lossy-decoded UTF-8 — raw stderr bytes should be read via `Cmd::spawn`.
+
 ## [0.4.1] - 2026-04-14
 
 ### Features

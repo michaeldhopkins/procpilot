@@ -5,29 +5,30 @@
 //! `inherit_stderr()` / `null_stderr()` / `merge_to_stdout()` builder methods.
 
 use std::fs::File;
+use std::sync::Arc;
 
-/// Where a child process's stderr (or stdout, when supported) goes.
+/// Where a child process's stderr goes.
 ///
 /// The default for [`Cmd::stderr()`](crate::Cmd) is [`Capture`](Self::Capture)
 /// — every error variant carries captured stderr, so that's almost always
-/// what production code wants. Use the other variants only when you have a
-/// reason.
-#[derive(Debug, Default)]
+/// what production code wants.
+#[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub enum Redirection {
     /// Capture into memory (default). Available in `RunOutput.stderr` on
     /// success and in error variants on failure.
     #[default]
     Capture,
-    /// Inherit the parent's file descriptor. Output streams to the parent's
-    /// stderr (i.e., the user's terminal) instead of being captured.
-    /// Useful when the child should prompt the user (e.g., `ssh` password
-    /// prompts) or when the user should see live progress.
+    /// Inherit the parent's file descriptor. Useful when the child should
+    /// prompt the user (e.g., `ssh` password prompts) or when the user
+    /// should see live progress.
     Inherit,
     /// Discard (`/dev/null`). Captured stderr will be empty.
     Null,
-    /// Redirect to a file. Captured stderr will be empty.
-    File(File),
+    /// Redirect to a file. The `Arc` lets [`Cmd`](crate::Cmd) stay `Clone`
+    /// — the underlying file is `try_clone()`d per spawn so every stage /
+    /// retry gets its own file descriptor.
+    File(Arc<File>),
 }
 
 #[cfg(test)]
