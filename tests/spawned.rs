@@ -176,6 +176,76 @@ fn spawn_missing_binary_is_spawn_error() {
 }
 
 #[test]
+fn wait_is_idempotent_on_success() {
+    let proc = Cmd::new(PP_ECHO).arg("idempotent").spawn().expect("spawn");
+    let first = proc.wait().expect("first wait ok");
+    let second = proc.wait().expect("second wait ok");
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(first.stderr, second.stderr);
+    assert_eq!(first.stdout_lossy().trim(), "idempotent");
+}
+
+#[test]
+fn wait_is_idempotent_on_failure() {
+    let proc = Cmd::new(PP_STATUS)
+        .args(["3", "--err", "stderr-bytes", "--out", "stdout-bytes"])
+        .spawn()
+        .expect("spawn");
+    let first = proc.wait().expect_err("first wait fails");
+    let second = proc.wait().expect_err("second wait fails");
+    assert_eq!(first.exit_status().unwrap().code(), Some(3));
+    assert_eq!(second.exit_status().unwrap().code(), Some(3));
+    assert_eq!(first.stderr(), second.stderr());
+    assert_eq!(first.stdout(), second.stdout());
+}
+
+#[test]
+fn try_wait_some_then_wait_returns_same() {
+    let proc = Cmd::new(PP_ECHO).arg("converges").spawn().expect("spawn");
+    // Wait for the child to exit so try_wait returns Some.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let first = loop {
+        if let Some(out) = proc.try_wait().expect("try_wait") {
+            break out;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("child never exited");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let second = proc.wait().expect("second wait after try_wait");
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(first.stdout_lossy().trim(), "converges");
+}
+
+#[test]
+fn wait_timeout_none_does_not_consume_state() {
+    let proc = Cmd::new(PP_SLEEP).arg("300").spawn().expect("spawn");
+    // First call returns None because child still running.
+    let first = proc
+        .wait_timeout(Duration::from_millis(50))
+        .expect("wait_timeout ok");
+    assert!(first.is_none());
+    // Subsequent wait should complete normally.
+    let out = proc.wait().expect("wait ok after timeout");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn concurrent_waits_see_same_outcome() {
+    use std::sync::Arc;
+    let proc = Arc::new(Cmd::new(PP_ECHO).arg("concurrent").spawn().expect("spawn"));
+    let p1 = proc.clone();
+    let p2 = proc.clone();
+    let h1 = thread::spawn(move || p1.wait().expect("wait 1"));
+    let h2 = thread::spawn(move || p2.wait().expect("wait 2"));
+    let a = h1.join().expect("join 1");
+    let b = h2.join().expect("join 2");
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(a.stdout_lossy().trim(), "concurrent");
+}
+
+#[test]
 fn concurrent_kill_unblocks_reader() {
     // If kill acquired a lock held by the in-flight read, this would deadlock.
     // shared_child's lock-free kill path must bypass the read path.

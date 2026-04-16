@@ -41,17 +41,52 @@ use crate::error::{RunError, truncate_suffix, truncate_suffix_string};
 ///
 /// For pipelines, `take_stdin` targets the leftmost stage, `take_stdout` the
 /// rightmost, and wait/kill operate on every stage. Exit status follows
-/// duct's pipefail rule: rightmost non-success wins.
+/// pipefail semantics: rightmost non-success wins.
+///
+/// # Wait idempotency
+///
+/// [`wait`](Self::wait), [`try_wait`](Self::try_wait), and
+/// [`wait_timeout`](Self::wait_timeout) are all idempotent. The first
+/// finalize captures stdout, stderr, and per-stage exit statuses into an
+/// internal `Arc`; subsequent calls reconstruct the same
+/// `Result<RunOutput, RunError>` from that cache. This matters for:
+///
+/// - **`tokio::select!`-style cancellation** where a pending `wait` future
+///   is dropped and a second `wait` is issued after `kill`.
+/// - **Retry loops** over a spawned handle.
+/// - **Concurrent `wait` calls** from multiple threads — internal
+///   serialization ensures both see the same outcome, not split-brain
+///   partial state.
+///
+/// Cost of the second call: one `Vec<u8>` clone and one `String` clone per
+/// invocation (the cached raw bytes are copied into a fresh `RunOutput`).
+/// For multi-gigabyte outputs this is not free, but the common cases
+/// (accidental double-call, cancellation pattern) are cheap.
+///
+/// # Dropping without waiting
 ///
 /// Dropping a `SpawnedProcess` without calling [`wait`](Self::wait) leaves
 /// the child(ren) to be reaped by the OS; a valid pattern for
-/// fire-and-forget jobs but may leave short-lived zombies until parent exit
-/// on Unix.
+/// fire-and-forget jobs but may leave short-lived zombies until parent
+/// exit on Unix.
 pub struct SpawnedProcess {
     children: Vec<Arc<SharedChild>>,
     stdout: Mutex<StdoutState>,
     stderr_threads: Mutex<Vec<thread::JoinHandle<Vec<u8>>>>,
     command: CmdDisplay,
+    // None until the first successful finalize; then populated with the
+    // raw ingredients so subsequent wait/try_wait/wait_timeout return the
+    // same outcome.
+    finalized: Mutex<Option<Arc<FinalizedState>>>,
+}
+
+/// Captured ingredients of a finished invocation. Shared across repeat
+/// calls to wait/try_wait/wait_timeout via `Arc` so the stdout/stderr are
+/// stored exactly once.
+struct FinalizedState {
+    statuses: Vec<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: String,
 }
 
 enum StdoutState {
@@ -75,6 +110,7 @@ impl SpawnedProcess {
             stdout: Mutex::new(StdoutState::NotTaken),
             stderr_threads: Mutex::new(stderr_thread.into_iter().collect()),
             command,
+            finalized: Mutex::new(None),
         }
     }
 
@@ -89,6 +125,7 @@ impl SpawnedProcess {
             stdout: Mutex::new(StdoutState::NotTaken),
             stderr_threads: Mutex::new(stderr_threads),
             command,
+            finalized: Mutex::new(None),
         }
     }
 
@@ -144,8 +181,13 @@ impl SpawnedProcess {
     }
 
     /// Non-blocking status check. `Ok(None)` means at least one stage is
-    /// still running; only returns `Ok(Some(_))` when every stage has exited.
+    /// still running; only returns `Ok(Some(_))` when every stage has
+    /// exited. Idempotent — after the first `Ok(Some(_))`, subsequent
+    /// calls return the same cached outcome.
     pub fn try_wait(&self) -> Result<Option<RunOutput>, RunError> {
+        if let Some(state) = self.cached_state() {
+            return self.reconstruct(&state).map(Some);
+        }
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
             match c.try_wait() {
@@ -159,12 +201,16 @@ impl SpawnedProcess {
                 }
             }
         }
-        self.finalize(statuses).map(Some)
+        self.finalize_or_cached(statuses).map(Some)
     }
 
     /// Block until every stage exits, then assemble a [`RunOutput`] or
     /// [`RunError::NonZeroExit`] using pipefail status precedence.
+    /// Idempotent — subsequent calls return the same cached outcome.
     pub fn wait(&self) -> Result<RunOutput, RunError> {
+        if let Some(state) = self.cached_state() {
+            return self.reconstruct(&state);
+        }
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
             let status = c.wait().map_err(|source| RunError::Spawn {
@@ -173,13 +219,17 @@ impl SpawnedProcess {
             })?;
             statuses.push(status);
         }
-        self.finalize(statuses)
+        self.finalize_or_cached(statuses)
     }
 
     /// Wait up to `timeout`. `Ok(None)` means at least one stage is still
     /// running after the timeout — caller decides whether to
-    /// [`kill`](Self::kill) or wait again.
+    /// [`kill`](Self::kill) or wait again. Idempotent once all stages
+    /// have exited.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<RunOutput>, RunError> {
+        if let Some(state) = self.cached_state() {
+            return self.reconstruct(&state).map(Some);
+        }
         let start = Instant::now();
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
@@ -195,28 +245,60 @@ impl SpawnedProcess {
                 }
             }
         }
-        self.finalize(statuses).map(Some)
+        self.finalize_or_cached(statuses).map(Some)
     }
 
-    fn finalize(&self, statuses: Vec<ExitStatus>) -> Result<RunOutput, RunError> {
-        let stderr_bytes = self.join_stderr_threads();
-        let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
-        let stdout_bytes = self.drain_remaining_stdout();
+    fn cached_state(&self) -> Option<Arc<FinalizedState>> {
+        self.finalized
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone))
+    }
 
-        let chosen = pipefail_status(&statuses);
+    fn reconstruct(&self, state: &FinalizedState) -> Result<RunOutput, RunError> {
+        let chosen = pipefail_status(&state.statuses);
         if chosen.success() {
             Ok(RunOutput {
-                stdout: stdout_bytes,
-                stderr: stderr_str,
+                stdout: state.stdout.clone(),
+                stderr: state.stderr.clone(),
             })
         } else {
             Err(RunError::NonZeroExit {
                 command: self.command.clone(),
                 status: chosen,
-                stdout: truncate_suffix(stdout_bytes),
-                stderr: truncate_suffix_string(stderr_str),
+                stdout: truncate_suffix(state.stdout.clone()),
+                stderr: truncate_suffix_string(state.stderr.clone()),
             })
         }
+    }
+
+    /// Holds the `finalized` lock for the entire finalize sequence so
+    /// concurrent callers can't race on draining stderr/stdout; whoever
+    /// gets the lock first fills the cache, others see it on entry.
+    fn finalize_or_cached(
+        &self,
+        statuses: Vec<ExitStatus>,
+    ) -> Result<RunOutput, RunError> {
+        let mut guard = self
+            .finalized
+            .lock()
+            .expect("finalized mutex poisoned");
+        if let Some(state) = guard.as_ref() {
+            let state = Arc::clone(state);
+            drop(guard);
+            return self.reconstruct(&state);
+        }
+        let stderr_bytes = self.join_stderr_threads();
+        let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let stdout_bytes = self.drain_remaining_stdout();
+        let state = Arc::new(FinalizedState {
+            statuses,
+            stdout: stdout_bytes,
+            stderr: stderr_str,
+        });
+        *guard = Some(Arc::clone(&state));
+        drop(guard);
+        self.reconstruct(&state)
     }
 
     fn join_stderr_threads(&self) -> Vec<u8> {

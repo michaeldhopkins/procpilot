@@ -209,6 +209,61 @@ fn retry_when_custom_predicate_can_stop_retrying() {
 }
 
 #[test]
+fn stdout_null_discards() {
+    let out = Cmd::new(PP_ECHO)
+        .arg("dropped")
+        .stdout(Redirection::Null)
+        .run()
+        .expect("ok");
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn stdout_file_redirects_to_a_real_file() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let file = tmp.reopen().expect("reopen");
+    let out = Cmd::new(PP_ECHO)
+        .arg("to-disk")
+        .stdout_file(file)
+        .run()
+        .expect("ok");
+    // stdout captured by procpilot is empty — everything went to the file.
+    assert!(out.stdout.is_empty());
+    let contents = std::fs::read_to_string(tmp.path()).expect("read");
+    assert!(contents.contains("to-disk"));
+}
+
+#[test]
+fn stderr_file_redirects_to_a_real_file() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let file = tmp.reopen().expect("reopen");
+    let err = Cmd::new(PP_STATUS)
+        .args(["1", "--err", "fatal error"])
+        .stderr_file(file)
+        .run()
+        .expect_err("fail");
+    // err.stderr() is empty because the bytes went to the file.
+    assert_eq!(err.stderr(), Some(""));
+    let contents = std::fs::read_to_string(tmp.path()).expect("read");
+    assert!(contents.contains("fatal error"));
+}
+
+#[test]
+fn non_capture_stdout_on_spawn_is_rejected() {
+    let err = Cmd::new(PP_ECHO)
+        .arg("x")
+        .stdout(Redirection::Null)
+        .spawn()
+        .expect_err("spawn should reject non-Capture stdout");
+    match err {
+        procpilot::RunError::Spawn { source, .. } => {
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        other => panic!("expected Spawn(InvalidInput), got {other:?}"),
+    }
+}
+
+#[test]
 fn stderr_null_discards() {
     let err = Cmd::new(PP_STATUS)
         .args(["1", "--err", "dropped"])
