@@ -183,6 +183,46 @@ fn spawn_pipeline_pipefail_on_wait() {
 }
 
 #[test]
+fn pipeline_spawn_failure_does_not_leak_earlier_stages() {
+    use std::time::Instant;
+    // First stage is a long-sleep; second stage is a missing binary.
+    // Without cleanup, the sleep would linger for 10 seconds while this
+    // test completes. With cleanup, the killed child lets .run() return
+    // quickly.
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("10000")
+        .pipe(Cmd::new("nonexistent_binary_xyz_42"))
+        .run()
+        .expect_err("should fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_spawn_failure());
+    // If cleanup works, we return as soon as the second spawn fails.
+    // Permit 2s for slow CI.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pipeline spawn-failure cleanup didn't kill stage 1 (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn spawn_pipeline_spawn_failure_kills_earlier_stages() {
+    use std::time::Instant;
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("10000")
+        .pipe(Cmd::new("nonexistent_binary_xyz_42"))
+        .spawn()
+        .expect_err("should fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_spawn_failure());
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "spawn pipeline cleanup didn't kill stage 1 (took {elapsed:?})"
+    );
+}
+
+#[test]
 fn display_renders_shell_style_pipeline() {
     let cmd = Cmd::new("git").arg("log").pipe(Cmd::new("grep").arg("feat"));
     let d = cmd.display();

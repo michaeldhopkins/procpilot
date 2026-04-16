@@ -4,6 +4,40 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-04-15
+
+### Features
+
+- **`procpilot::prelude`** module exporting the everyday types: `Cmd`, `RunError`, `RunOutput`, `Redirection`, `RetryPolicy`, `StdinData`, `SpawnedProcess`, and (with the `tokio` feature) `AsyncSpawnedProcess`. `use procpilot::prelude::*;` cuts the import line for typical callers.
+
+## [0.6.0] - 2026-04-15
+
+### Breaking changes
+
+- **`StdinData` is now `#[non_exhaustive]`.** Downstream `match` expressions on the enum require a wildcard arm.
+- **`StdinData::Reader` variant's inner type is `Box<dyn Read + Send + 'static>`** (previously `+ Sync`). Migration: no code change unless you were relying on the `Sync` bound at the variant's pattern-bound `r`; callers that accept the type can loosen their bounds in turn.
+- **`RunOutput` is now `#[non_exhaustive]`.** Downstream construction via struct literal is no longer allowed; use procpilot's runners to obtain one. Field access is unchanged.
+- **`Cmd::to_command` renamed to [`Cmd::to_rightmost_command`].** The old name silently returned the rightmost stage for pipelines; the rename makes that explicit. For single commands the behavior is identical. For pipelines, use [`Cmd::to_commands`] to get every stage.
+- **`Redirection::File(File)` (pre-0.5.0) stays `Redirection::File(Arc<File>)`**; construct via new [`Redirection::file`] or [`Cmd::stderr_file`] / [`Cmd::stdout_file`] helpers instead of wrapping `Arc` yourself.
+- **`BeforeSpawnHook` type alias is no longer a public re-export.** Callers pass closures to [`Cmd::before_spawn`]; no type name needed.
+- **`StdinData::is_reusable()` removed.** Match on the variant directly if you need this distinction (rare).
+
+### Features
+
+- **`Cmd::run_async` and `Cmd::spawn_async`** behind the new `tokio` feature (opt-in). Single commands and pipelines on both; `spawn_async` returns an `AsyncSpawnedProcess` handle.
+- **`AsyncSpawnedProcess`** — tokio counterpart to `SpawnedProcess`. `take_stdin` / `take_stdout` (tokio types), `pids`, `kill`, `wait`, `try_wait`, `wait_timeout`. Pipeline support with pipefail status precedence.
+- **`StdinData::AsyncReader` variant** + **`StdinData::from_async_reader`** constructor (tokio feature). True async streaming via `tokio::io::copy` — no buffering. Passing to the sync runner returns `RunError::Spawn` with `ErrorKind::InvalidInput`.
+- **`before_spawn` works on the async path** via `tokio::process::Command::as_std_mut()`. Same hook signature; fires per stage per retry attempt on both sync and async paths.
+- **Idempotent `wait` / `try_wait` / `wait_timeout`** on `SpawnedProcess` and `AsyncSpawnedProcess`. First finalize caches stdout / stderr / per-stage statuses in an internal `Arc`; subsequent calls reconstruct the same `Result`. Matters for `tokio::select!` cancellation patterns and for any retry-after-kill flow. Concurrent `wait` from multiple threads on sync `SpawnedProcess` is serialized via a mutex so no split-brain state.
+- **Mid-pipeline spawn-failure cleanup.** When a later stage's spawn fails, already-spawned stages are killed before the error propagates — sync path uses explicit `kill + wait`, async path uses `tokio::process::Command::kill_on_drop(true)`.
+- **Iterative `CmdTree` flatten.** Removes recursion risk on pathologically deep pipelines.
+- **Stdout routing.** New [`Cmd::stdout`] builder accepting a [`Redirection`] plus [`Cmd::stdout_file`] / [`Cmd::stderr_file`] shortcuts and [`Redirection::file`] constructor. Honored on [`Cmd::run`] / [`Cmd::run_async`]; rejected (with `ErrorKind::InvalidInput`) on [`Cmd::spawn`] / [`Cmd::spawn_async`] because the handle needs stdout piped.
+
+### Not yet on the async path
+
+- `impl AsyncRead for AsyncSpawnedProcess` — use `take_stdout()` meanwhile.
+- Concurrent `kill`-during-`wait` via `&self` — use `tokio::select!` to race wait against kill.
+
 ## [0.5.1] - 2026-04-14
 
 ### Features

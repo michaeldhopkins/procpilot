@@ -1,42 +1,32 @@
 # procpilot
 
-Production-grade subprocess runner for Rust — typed errors, retry with backoff, timeout, stdin piping, secret redaction.
+Subprocess runner for Rust. Typed errors, retry, timeout, stdin piping, pipelines, secret redaction, optional async.
 
-Built for CLI tools that spawn external processes and need precise failure handling. Not intended for shell scripting (see [xshell](https://crates.io/crates/xshell) for that).
+## What it does
 
-## Why not `std::process::Command`?
-
-`Command::output()` returns a status the caller must remember to check. `Command::spawn()` gives you a `Child` but no help with timeout, retry, or deadlock-safe pipe draining. Every production CLI ends up writing the same wrapping layer.
-
-`procpilot` is that layer.
-
-- **Typed errors** — [`RunError`] distinguishes `Spawn` (couldn't start), `NonZeroExit` (command ran and failed, with captured stdout/stderr), and `Timeout` (killed after budget).
-- **Retry with exponential backoff + jitter** — [`Cmd::retry`] / [`Cmd::retry_when`].
-- **Timeout + deadline** — per-attempt timeout or overall wall-clock budget across retries.
-- **Stdin piping** — owned bytes (reusable across retries) or a boxed `Read` (one-shot streaming).
-- **Stderr routing** — capture / inherit / null / redirect-to-file via [`Redirection`].
-- **Secret redaction** — [`Cmd::secret`] replaces args with `<secret>` in error output and logs.
-- **Streaming / bidirectional** — [`Cmd::spawn`] returns a [`SpawnedProcess`] (single command or pipeline) with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines` for line-by-line callbacks.
-- **Pipelines** — [`Cmd::pipe`] or the `|` operator chains commands (`a | b | c`) with duct-style pipefail status precedence. `Cmd::run()` and `Cmd::spawn()` both work on pipelines.
-- **Cloneable `Cmd`** — configure a base `Cmd` once, clone it to branch off variants. Bytes-stdin and file handles are `Arc`-shared across clones; reader-stdin is one-shot.
-- **`impl Display for Cmd`** — `format!("{cmd}")` renders shell-style with secret redaction.
+- `RunError` with `Spawn`, `NonZeroExit`, and `Timeout` variants (captured stdout/stderr on the latter two).
+- Retry via `backon` (exponential backoff + jitter) with a configurable predicate.
+- `.timeout()` per attempt, `.deadline()` across all attempts.
+- Stdin from owned bytes (reusable across retries) or a boxed `Read` (one-shot).
+- Stdout/stderr routing: capture, inherit, null, redirect to file. `Cmd::run` honors both; `Cmd::spawn` always pipes stdout so the handle can expose it.
+- `.secret()` replaces args with `<secret>` in error output and logs.
+- `.spawn()` returns a `SpawnedProcess` with `take_stdin` / `take_stdout`, `Read` impls, `kill`, `wait`, `wait_timeout`, and `spawn_and_collect_lines`.
+- Pipelines via `.pipe()` or `|`, executed with pipefail status precedence.
+- `Cmd: Clone` for base-plus-variants usage; `impl Display for Cmd`.
+- Async (`.run_async()`, `.spawn_async()`) behind the `tokio` feature.
 
 ## Usage
 
 ```toml
 [dependencies]
-procpilot = "0.5"
+procpilot = "0.6"
 ```
 
-### Reusing a base `Cmd`
+For async (tokio) users:
 
-```rust
-use procpilot::Cmd;
-
-let base = Cmd::new("git").in_dir("/repo").env("GIT_TERMINAL_PROMPT", "0");
-let status = base.clone().args(["status", "--short"]).run()?;
-let log    = base.clone().args(["log", "-1", "--oneline"]).run()?;
-# Ok::<(), procpilot::RunError>(())
+```toml
+[dependencies]
+procpilot = { version = "0.6", features = ["tokio"] }
 ```
 
 ```rust
@@ -49,6 +39,27 @@ let output = Cmd::new("git")
     .env("GIT_TERMINAL_PROMPT", "0")
     .timeout(Duration::from_secs(30))
     .run()?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+For codebases that reach for procpilot's types frequently, a `prelude` is available:
+
+```rust
+use procpilot::prelude::*;
+
+let _: Cmd = Cmd::new("git").stderr(Redirection::Inherit);
+```
+
+### Reusing a base `Cmd`
+
+`Cmd` is `Clone`, so you can build a base configuration once and branch off variants:
+
+```rust
+use procpilot::Cmd;
+
+let base = Cmd::new("git").in_dir("/repo").env("GIT_TERMINAL_PROMPT", "0");
+let status = base.clone().args(["status", "--short"]).run()?;
+let log    = base.clone().args(["log", "-1", "--oneline"]).run()?;
 # Ok::<(), procpilot::RunError>(())
 ```
 
@@ -83,7 +94,7 @@ Cmd::new("git")
 
 ### Deadline across retries
 
-`.timeout()` bounds a single attempt; `.deadline()` bounds the whole operation (including retry backoff sleeps). Combine them when you want "retry up to 3× but never exceed 10 seconds total".
+`.timeout()` bounds a single attempt; `.deadline()` bounds the whole operation (including retry backoff sleeps).
 
 ```rust
 use std::time::{Duration, Instant};
@@ -99,9 +110,9 @@ Cmd::new("git")
 # Ok::<(), procpilot::RunError>(())
 ```
 
-### Inheriting stderr (live progress)
+### Inheriting stderr
 
-When the child prompts the user or should stream progress to the terminal, route stderr with `Redirection::Inherit` instead of capturing it.
+Route the child's stderr to the parent's stderr (instead of capturing) with `Redirection::Inherit`. Useful when the child prompts the user or when live progress should be visible.
 
 ```rust
 use procpilot::{Cmd, Redirection};
@@ -125,7 +136,7 @@ Cmd::new("kubectl").args(["apply", "-f", "-"]).stdin(manifest).run()?;
 
 ### Pipelines
 
-Chain commands with [`Cmd::pipe`] or the `|` operator. Per-stage builders (`arg`, `args`, `env`, `in_dir`) target the rightmost stage; pipeline-level knobs (`stdin`, `timeout`, `retry`, `stderr`) apply to the whole thing.
+Chain commands with [`Cmd::pipe`] or the `|` operator. Per-stage builders (`arg`, `args`, `env`, `in_dir`) target the rightmost stage; pipeline-level knobs (`stdin`, `timeout`, `retry`, `stderr`) apply to the pipeline.
 
 ```rust
 use procpilot::Cmd;
@@ -143,11 +154,11 @@ let out = (Cmd::new("git").args(["log", "--oneline"])
 # Ok::<(), procpilot::RunError>(())
 ```
 
-Failure status follows duct's pipefail rule: any non-success trumps success; the **rightmost** non-success wins. All stages' stderr is captured and concatenated (capture mode) or routed identically (inherit/null/file).
+Failure status follows pipefail semantics: any non-success trumps success; the **rightmost** non-success wins. All stages' stderr is captured and concatenated (capture mode) or routed identically (inherit/null/file).
 
 ### Streaming (spawned processes)
 
-For long-lived or bidirectional processes, use [`Cmd::spawn`] instead of `.run()`. The returned `SpawnedProcess` gives you ownership of stdin/stdout pipes and `&self` `wait` / `kill` so you can share the handle across threads.
+For long-lived or bidirectional processes, use [`Cmd::spawn`] instead of `.run()`. `SpawnedProcess` exposes ownership of stdin/stdout pipes; lifecycle methods (`wait`, `kill`) take `&self` so the handle can be shared across threads.
 
 ```rust
 use std::io::{BufRead, BufReader, Write};
@@ -178,7 +189,7 @@ let _ = proc.wait();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-For the common "read lines as they arrive" case:
+Line-at-a-time variant:
 
 ```rust
 use procpilot::Cmd;
@@ -200,6 +211,83 @@ Cmd::new("docker").args(["login", "-p", "hunter2"]).secret().run()?;
 // Error messages show `docker <secret>` instead of the token.
 # Ok::<(), procpilot::RunError>(())
 ```
+
+## Async (tokio)
+
+Enable the `tokio` feature to use `.run_async()` and `.spawn_async()` from inside a tokio runtime. The sync `.run()` would block the executor thread.
+
+```toml
+[dependencies]
+procpilot = { version = "0.6", features = ["tokio"] }
+```
+
+```rust
+use procpilot::Cmd;
+
+let out = Cmd::new("git")
+    .args(["rev-parse", "HEAD"])
+    .in_dir(&repo)
+    .run_async()
+    .await?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+Run commands concurrently:
+
+```rust
+use procpilot::Cmd;
+
+let branch = Cmd::new("git").args(["branch", "--show-current"]).in_dir(&repo).run_async();
+let remote = Cmd::new("git").args(["remote", "get-url", "origin"]).in_dir(&repo).run_async();
+let status = Cmd::new("git").args(["status", "--porcelain"]).in_dir(&repo).run_async();
+
+let (b, r, s) = tokio::try_join!(branch, remote, status)?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+`.spawn_async()` returns an `AsyncSpawnedProcess` for streaming:
+
+```rust
+use procpilot::Cmd;
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+let mut proc = Cmd::new("kubectl").args(["logs", "-f", pod]).spawn_async().await?;
+let stdout = proc.take_stdout().expect("piped");
+let mut lines = BufReader::new(stdout).lines();
+while let Ok(Some(line)) = lines.next_line().await {
+    handle(&line);
+}
+proc.wait().await?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+Cancellation via `tokio::select!`:
+
+```rust
+tokio::select! {
+    res = proc.wait() => { res?; }
+    _ = cancel.cancelled() => {
+        let _ = proc.kill().await;
+        let _ = proc.wait().await;
+    }
+}
+# Ok::<(), procpilot::RunError>(())
+```
+
+Pipelines:
+
+```rust
+let out = (Cmd::new("git").args(["log", "--oneline"]) | Cmd::new("head").arg("-5"))
+    .run_async()
+    .await?;
+# Ok::<(), procpilot::RunError>(())
+```
+
+All builder knobs (`arg`, `args`, `env`, `envs`, `in_dir`, `stdin`, `stderr`, `timeout`, `deadline`, `retry`, `retry_when`, `secret`, `pipe`, `|`) work identically on the async path.
+
+Not yet on the async path:
+- `impl AsyncRead for AsyncSpawnedProcess` (use `take_stdout()`).
+- `&self` lifecycle methods — use `tokio::select!` to race `wait` against `kill`.
 
 ## License
 
