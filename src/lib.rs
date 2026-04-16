@@ -71,8 +71,12 @@ mod error;
 mod redirection;
 mod retry;
 mod runner;
+mod runner_trait;
 mod spawned;
 mod stdin;
+#[cfg(feature = "testing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
+pub mod testing;
 
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
@@ -83,6 +87,7 @@ pub use error::{RunError, STREAM_SUFFIX_SIZE};
 pub use redirection::Redirection;
 pub use retry::{RetryPolicy, default_transient};
 pub use runner::{binary_available, binary_version};
+pub use runner_trait::{DefaultRunner, Runner};
 pub use spawned::SpawnedProcess;
 pub use stdin::StdinData;
 
@@ -103,6 +108,7 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub use crate::AsyncSpawnedProcess;
     pub use crate::{
-        Cmd, Redirection, RetryPolicy, RunError, RunOutput, SpawnedProcess, StdinData,
+        Cmd, DefaultRunner, Redirection, RetryPolicy, RunError, RunOutput, Runner, SpawnedProcess,
+        StdinData,
     };
 }

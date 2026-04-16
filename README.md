@@ -14,6 +14,7 @@ Subprocess runner for Rust. Typed errors, retry, timeout, stdin piping, pipeline
 - Pipelines via `.pipe()` or `|`, executed with pipefail status precedence.
 - `Cmd: Clone` for base-plus-variants usage; `impl Display for Cmd`.
 - Async (`.run_async()`, `.spawn_async()`) behind the `tokio` feature.
+- Pluggable `Runner` trait + `DefaultRunner` for testable code; `MockRunner` and result-builder helpers behind the `testing` feature.
 
 ## Usage
 
@@ -211,6 +212,43 @@ Cmd::new("docker").args(["login", "-p", "hunter2"]).secret().run()?;
 // Error messages show `docker <secret>` instead of the token.
 # Ok::<(), procpilot::RunError>(())
 ```
+
+## Mocking subprocesses in unit tests
+
+Functions that take `&dyn Runner` (instead of calling `Cmd::run` directly) can be unit-tested without spawning real processes.
+
+Production code:
+
+```rust
+use procpilot::{Cmd, Runner, RunError};
+use std::path::Path;
+
+pub fn current_branch(runner: &dyn Runner, repo: &Path) -> Result<String, RunError> {
+    let cmd = Cmd::new("git").args(["branch", "--show-current"]).in_dir(repo);
+    let out = runner.run(cmd)?;
+    Ok(out.stdout_lossy().trim().to_string())
+}
+```
+
+In production: pass `&DefaultRunner`. In tests (with the `testing` feature):
+
+```rust
+# #[cfg(feature = "testing")]
+# {
+use procpilot::testing::{MockRunner, ok_str};
+
+let mock = MockRunner::new()
+    .expect("git branch --show-current", ok_str("main\n"));
+
+let branch = current_branch(&mock, std::path::Path::new("/repo")).unwrap();
+assert_eq!(branch, "main");
+mock.verify().unwrap();
+# }
+```
+
+`MockRunner::expect_when` takes a predicate over `&Cmd` for matching on cwd / env / other state the display string doesn't carry. Match-count variants (`expect_repeated`, `expect_always`) handle code under test that calls the same command multiple times — retry loops, polling, etc. Result-builder helpers (`ok`, `ok_str`, `nonzero`, `spawn_error`, `timeout`) return a `MockResult` the runner resolves into the final `Result` at match time, so `err.command()` in your test assertions shows the real invoked command.
+
+**Current limitation:** the `Runner` trait only covers `.run()`. Code that calls `.spawn()`, `.spawn_async()`, or `.run_async()` still hits real subprocesses — route shell-outs through `runner.run(cmd)` for now if you need full mockability. Spawn-handle mocking is tracked as follow-up work.
 
 ## Async (tokio)
 
