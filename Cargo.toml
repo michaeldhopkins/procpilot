@@ -1,6 +1,6 @@
 [package]
 name = "procpilot"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Production-grade subprocess runner with typed errors, retry, and timeout"
@@ -24,14 +24,19 @@ exclude = [
 # Internal feature gating mock test binaries and integration tests. Not
 # intended for downstream consumers. Enabled automatically in CI and when
 # running `cargo test --all-features` locally.
-test-helpers = []
+mock-binaries = []
 
 # Opt-in async variants (`Cmd::run_async`, `Cmd::spawn_async`) for use
 # from inside a tokio runtime. Off by default — sync-only consumers
 # pay nothing.
 tokio = ["dep:tokio", "backon/tokio-sleep"]
 
-# Mock test binaries. Prefixed `pp_` and gated behind the `test-helpers`
+# Opt-in test doubles: `MockRunner` and result-builder helpers for unit
+# tests of code that takes `&dyn Runner`. Off by default — production
+# builds don't compile mock infrastructure.
+testing = []
+
+# Mock test binaries. Prefixed `pp_` and gated behind the `mock-binaries`
 # feature so they aren't built during `cargo install procpilot`. During
 # `cargo test --all-features`, cargo builds them and sets
 # `CARGO_BIN_EXE_pp_*` so the integration tests can reach them.
@@ -39,70 +44,75 @@ tokio = ["dep:tokio", "backon/tokio-sleep"]
 [[bin]]
 name = "pp_cat"
 path = "src/bin/pp_cat.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_echo"
 path = "src/bin/pp_echo.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_sleep"
 path = "src/bin/pp_sleep.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_status"
 path = "src/bin/pp_status.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_print_env"
 path = "src/bin/pp_print_env.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_print_env_multi"
 path = "src/bin/pp_print_env_multi.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_pwd"
 path = "src/bin/pp_pwd.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_spam"
 path = "src/bin/pp_spam.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[bin]]
 name = "pp_child_grandchild"
 path = "src/bin/pp_child_grandchild.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 # Integration test that depends on the mock binaries. Skipped when
-# `test-helpers` is off so `cargo test` (without feature flag) still
+# `mock-binaries` is off so `cargo test` (without feature flag) still
 # works for unit tests.
 [[test]]
 name = "runner"
 path = "tests/runner.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[test]]
 name = "spawned"
 path = "tests/spawned.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[test]]
 name = "pipeline"
 path = "tests/pipeline.rs"
-required-features = ["test-helpers"]
+required-features = ["mock-binaries"]
 
 [[test]]
 name = "async_runner"
 path = "tests/async_runner.rs"
-required-features = ["test-helpers", "tokio"]
+required-features = ["mock-binaries", "tokio"]
+
+[[test]]
+name = "mock_runner"
+path = "tests/mock_runner.rs"
+required-features = ["testing"]
 
 [package.metadata.docs.rs]
 all-features = true

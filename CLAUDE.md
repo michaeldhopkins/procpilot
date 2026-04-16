@@ -7,7 +7,7 @@ Production-grade subprocess runner for Rust. Published as a library crate on cra
 Before every commit, verify:
 1. [ ] `cargo clippy --all-features --all-targets -- -D warnings` passes
 2. [ ] `cargo clippy --no-default-features --all-targets -- -D warnings` passes
-3. [ ] `cargo test --all-features` passes (integration tests require `test-helpers`)
+3. [ ] `cargo test --all-features` passes (integration tests require `mock-binaries`)
 4. [ ] `cargo test --lib` passes without features (unit-only sanity check)
 5. [ ] `cargo test --doc --all-features` passes
 6. [ ] Version bumped in `Cargo.toml` (patch for fixes/docs, minor for features, `0.x` breaking bumps minor)

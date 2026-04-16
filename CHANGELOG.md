@@ -4,6 +4,28 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-15
+
+### Breaking changes
+
+- **`test-helpers` feature renamed to `mock-binaries`.** The feature name now describes what it gates (internal mock `pp_*` binaries used for procpilot's own integration tests) rather than hinting at a public testing surface. Migration: replace every `features = ["test-helpers"]` with `features = ["mock-binaries"]` in any crate enabling the internal test infrastructure.
+
+### Features
+
+- **`Runner` trait + `DefaultRunner`** — pluggable subprocess execution backend. Always available (no feature flag). Production code that takes `&dyn Runner` can be unit-tested with a mock backend without spawning processes. Added to the prelude.
+- **`testing` feature** gating mock infrastructure. Behind the flag:
+  - **`MockRunner`** — registers expectations matching by command-display string or arbitrary `Fn(&Cmd) -> bool` predicate.
+  - **Match-count control**: `expect` / `expect_when` (one-shot), `expect_repeated` / `expect_when_repeated` (up to N times), `expect_always` / `expect_when_always` (unlimited). Repeated/unlimited variants take a `FnMut() -> MockResult` factory called on each match.
+  - `verify()` reports unmet expectations. `error_on_no_match()` switches no-match behavior from panic (default) to `RunError::Spawn`.
+  - Panics no longer poison the internal mutex — caught panics are safe to recover from.
+  - **`MockResult`** enum — command-agnostic outcome that `MockRunner` resolves at match time, attaching the actual invoked command's display to the error. Replaces the old placeholder-in-the-error pattern so `err.command()` always reflects the real command. `MockResult::resolve(&CmdDisplay)` is public for custom `Runner` impls.
+  - **Result-builder helpers**: `ok`, `ok_str`, `nonzero`, `spawn_error`, `timeout` — return `MockResult`. Construct error variants without writing `ExitStatus::from_raw` boilerplate.
+- New `examples/testable.rs` walks through the production-and-test pattern end-to-end (`cargo run --example testable --features testing`).
+
+### Limitations
+
+- `Runner` only abstracts the sync `.run()` path. Code that calls `.spawn()` / `.spawn_and_collect_lines()` / `.run_async()` / `.spawn_async()` still hits real subprocesses; spawn-handle mocking is a tracked follow-up.
+
 ## [0.6.1] - 2026-04-15
 
 ### Features
