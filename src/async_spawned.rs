@@ -191,6 +191,7 @@ impl AsyncSpawnedProcess {
                 status: chosen,
                 stdout: truncate_suffix(state.stdout.clone()),
                 stderr: truncate_suffix_string(state.stderr.clone()),
+                attempts: 1,
             })
         }
     }

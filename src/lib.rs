@@ -38,6 +38,10 @@
 //! - **Timeout + deadline**: [`Cmd::timeout`] for per-attempt,
 //!   [`Cmd::deadline`] for overall wall-clock budget across retries.
 //! - **Retry with exponential backoff**: [`Cmd::retry`] / [`Cmd::retry_when`].
+//! - **Caller-driven cancellation**: [`Cmd::cancel`] takes an
+//!   `Arc<AtomicBool>` flag; flipping it kills the child (with a
+//!   configurable SIGTERM→SIGKILL grace on Unix) and short-circuits any
+//!   pending retry backoff.
 //! - **Pipelines**: [`Cmd::pipe`] or the `|` operator chains commands
 //!   (`a | b | c`) with pipefail semantics — non-success on any stage
 //!   fails the pipeline, rightmost non-success wins. Works on both

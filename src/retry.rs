@@ -70,14 +70,15 @@ impl std::fmt::Debug for RetryPolicy {
 ///
 /// Retries on `NonZeroExit` whose stderr contains `"stale"` (jj working-copy
 /// staleness) or `".lock"` (git/jj lock-file contention). Never retries
-/// `Spawn` (binary-missing errors don't get better) or `Timeout` (a hung
-/// process retried is still hung).
+/// `Spawn` (binary-missing errors don't get better), `Timeout` (a hung
+/// process retried is still hung), or `Cancelled` (the caller asked to
+/// stop — retrying would contradict that).
 pub fn default_transient(err: &RunError) -> bool {
     match err {
         RunError::NonZeroExit { stderr, .. } => {
             stderr.contains("stale") || stderr.contains(".lock")
         }
-        RunError::Spawn { .. } | RunError::Timeout { .. } => false,
+        RunError::Spawn { .. } | RunError::Timeout { .. } | RunError::Cancelled { .. } => false,
     }
 }
 
@@ -107,6 +108,7 @@ mod tests {
             status,
             stdout: vec![],
             stderr: stderr.to_string(),
+            attempts: 1,
         }
     }
 
@@ -123,6 +125,7 @@ mod tests {
             elapsed: Duration::from_secs(30),
             stdout: vec![],
             stderr: String::new(),
+            attempts: 1,
         }
     }
 
@@ -151,6 +154,17 @@ mod tests {
     #[test]
     fn default_transient_skips_timeout() {
         assert!(!default_transient(&fake_timeout()));
+    }
+
+    #[test]
+    fn default_transient_skips_cancelled() {
+        let cancelled = RunError::Cancelled {
+            command: cd("x"),
+            stdout: vec![],
+            stderr: String::new(),
+            attempts: 1,
+        };
+        assert!(!default_transient(&cancelled));
     }
 
     #[test]

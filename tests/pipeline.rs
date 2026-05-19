@@ -228,3 +228,55 @@ fn display_renders_shell_style_pipeline() {
     let d = cmd.display();
     assert_eq!(d.to_string(), "git log | grep feat");
 }
+
+#[test]
+fn cancel_kills_all_pipeline_stages() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Instant;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    // Both stages sleep for a minute — without cancellation this would hang.
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000")
+        .pipe(Cmd::new(PP_SLEEP).arg("60000"))
+        .cancel(flag)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "pipeline cancel didn't bail promptly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn cancel_pre_set_skips_pipeline_spawn() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    let flag = Arc::new(AtomicBool::new(true)); // pre-set
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000")
+        .pipe(Cmd::new(PP_SLEEP).arg("60000"))
+        .cancel(flag)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled());
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "pre-flight should not spawn pipeline, took {elapsed:?}"
+    );
+}

@@ -4,6 +4,31 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-05-18
+
+### Breaking changes
+
+- **`RunError::NonZeroExit`, `RunError::Timeout`, and the new `RunError::Cancelled` carry an `attempts: u32` field.** Code that destructures these variants by name without `..` will fail to compile. Migration: add `attempts` to the pattern or end the brace list with `, ..`. The new accessor `RunError::attempts() -> u32` is the recommended way to read it (returns 1 for `Spawn` too, so it works on any variant).
+- **`MockResult::Timeout` and `MockResult::NonZeroExit` (testing feature) build the corresponding `RunError` variants with `attempts: 1`.** Existing tests that construct `MockResult` values via the helper functions (`timeout`, `nonzero`) are unaffected. Tests that build raw `RunError` literals must add the field.
+
+### Features
+
+- **`Cmd::cancel(Arc<AtomicBool>)`** — caller-driven cancellation for in-flight runs. Flipping the flag kills the child and returns `RunError::Cancelled`. Composes with `timeout`, `deadline`, `retry`, and pipelines. Pre-flight: a flag that is already `true` at call time returns `Cancelled` immediately without spawning anything. Polling cadence: 50ms during the run and across retry-backoff sleeps.
+- **`Cmd::cancel_grace(Duration)`** — configurable SIGTERM→SIGKILL grace period (Unix; default 500ms). Windows kills via `TerminateProcess` immediately and ignores this setting.
+- **`RunError::Cancelled { command, stdout, stderr, attempts }`** — new error variant. Carries any output captured before kill and the 1-based attempt number on which cancellation fired.
+- **`RunError::attempts() -> u32`** — read the attempt count on any variant. For `NonZeroExit`/`Timeout`/`Cancelled` from a retried run, this tells you how many tries happened before the final error.
+- **`RunError::is_cancelled()`** — predicate matching the new variant.
+- **`MockResult::Cancelled { stdout, stderr }`** — testing helper for the new variant. Resolves to `RunError::Cancelled` with `attempts: 1`.
+
+### Behavior
+
+- The default retry predicate (`default_transient`) does not retry `Cancelled` — the caller asked to stop, so we stop.
+- During a retry loop, a fired cancel flag short-circuits both the in-flight attempt and any pending backoff sleep. The returned `Cancelled` carries the attempt number that was in flight (or just failed) when the flag fired.
+
+### Async parity
+
+- `Cmd::run_async` honors `cancel` and `cancel_grace` with the same semantics as the sync path (pre-flight, in-flight polling, retry short-circuit, pipeline kill-all). Implementation polls `try_wait()` at the cancel cadence rather than racing futures with `tokio::select!` — worst-case 50ms latency on exit detection when cancel is active, negligible for any realistic workload.
+
 ## [0.7.0] - 2026-04-15
 
 ### Breaking changes

@@ -318,3 +318,150 @@ fn before_spawn_hook_invoked() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(out.stdout_lossy().trim(), "hi");
 }
+
+// ---------- cancellation ----------
+
+#[test]
+fn cancel_pre_set_skips_spawn_and_returns_immediately() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(true)); // already cancelled
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000") // would sleep a full minute if it ran
+        .cancel(flag)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert_eq!(err.stdout(), Some(&[][..]));
+    assert_eq!(err.stderr(), Some(""));
+    assert_eq!(err.attempts(), 1);
+    // Pre-flight returns immediately — far below the 60s sleep, even
+    // accounting for slow CI machines.
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "pre-flight cancel should return immediately, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn cancel_mid_run_kills_child_and_returns_cancelled() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    // Set the flag from a background thread after a small delay so the
+    // child has actually started.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000")
+        .cancel(flag)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    // We should bail out well before the 60s sleep — 5s budget is very
+    // generous and covers the 50ms poll cadence + 500ms grace period.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel didn't bail promptly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn cancel_does_not_affect_normal_completion() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let out = Cmd::new(PP_ECHO)
+        .arg("hello")
+        .cancel(flag)
+        .run()
+        .expect("ok");
+    assert_eq!(out.stdout_lossy().trim(), "hello");
+}
+
+#[test]
+fn cancel_with_retry_short_circuits_backoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    // Trip the flag while we're (presumably) inside the backoff sleep on
+    // attempt 2 or 3. The default retry policy sleeps 100ms then 200ms,
+    // so 150ms catches the first backoff window.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    // Always-retry predicate so we definitely enter the backoff path.
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry_when(|_| true)
+        .cancel(flag)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    // attempts >= 1 — exact count is timing dependent, but it must be
+    // tagged with the in-flight attempt number.
+    assert!(err.attempts() >= 1);
+    // Full default backoff to exhaustion would be ~700ms+; bailing during
+    // the first or second backoff means total well under 2s on any sane
+    // machine.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "cancel didn't short-circuit retry backoff, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn nonzero_exit_carries_attempts_one_without_retry() {
+    let err = Cmd::new(PP_STATUS).arg("1").run().expect_err("fail");
+    assert_eq!(err.attempts(), 1);
+}
+
+#[test]
+fn nonzero_exit_carries_full_attempt_count_on_retry_exhaustion() {
+    use procpilot::RetryPolicy;
+    let policy = RetryPolicy::default(); // 3 retries total
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry(policy)
+        .retry_when(|_| true) // always retry
+        .run()
+        .expect_err("fail");
+    assert!(err.is_non_zero_exit());
+    // Default backon ExponentialBuilder retries `with_max_times(3)`, so
+    // the initial call + 3 retries = 4 attempts total.
+    assert_eq!(err.attempts(), 4, "expected 4 attempts, got {}", err.attempts());
+}
+
+#[test]
+fn cancel_grace_is_clonable_with_cmd() {
+    // Sanity: building a Cmd with cancel + grace, cloning it, and running
+    // a normal command works without panicking.
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let base = Cmd::new(PP_ECHO)
+        .arg("hi")
+        .cancel(flag)
+        .cancel_grace(Duration::from_millis(200));
+    let _ = base.clone().run().expect("ok");
+}

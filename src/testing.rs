@@ -373,6 +373,10 @@ pub enum MockResult {
         stdout: Vec<u8>,
         stderr: String,
     },
+    Cancelled {
+        stdout: Vec<u8>,
+        stderr: String,
+    },
 }
 
 impl MockResult {
@@ -395,6 +399,7 @@ impl MockResult {
                 status: build_exit_status(code),
                 stdout,
                 stderr,
+                attempts: 1,
             }),
             Self::Spawn { source } => Err(RunError::Spawn {
                 command: command.clone(),
@@ -409,6 +414,13 @@ impl MockResult {
                 elapsed,
                 stdout,
                 stderr,
+                attempts: 1,
+            }),
+            Self::Cancelled { stdout, stderr } => Err(RunError::Cancelled {
+                command: command.clone(),
+                stdout,
+                stderr,
+                attempts: 1,
             }),
         }
     }

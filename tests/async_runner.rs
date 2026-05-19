@@ -485,3 +485,96 @@ async fn spawn_async_streaming_lines() {
     let _ = proc.wait().await;
     assert_eq!(lines, vec!["one", "two", "three"]);
 }
+
+// ---------- cancellation ----------
+
+#[tokio::test]
+async fn run_async_cancel_pre_set_returns_immediately() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(true));
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000")
+        .cancel(flag)
+        .run_async()
+        .await
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert_eq!(err.attempts(), 1);
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "async pre-flight cancel slow: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_async_cancel_mid_run_kills_child() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("60000")
+        .cancel(flag)
+        .run_async()
+        .await
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "async cancel slow: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_async_cancel_short_circuits_retry_backoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    let start = Instant::now();
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry_when(|_| true)
+        .cancel(flag)
+        .run_async()
+        .await
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "async retry-backoff cancel slow: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_async_nonzero_exit_carries_attempt_count_on_retry_exhaustion() {
+    let policy = RetryPolicy::default();
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry(policy)
+        .retry_when(|_| true)
+        .run_async()
+        .await
+        .expect_err("fail");
+    assert!(err.is_non_zero_exit());
+    assert_eq!(err.attempts(), 4);
+}

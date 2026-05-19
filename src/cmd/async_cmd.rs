@@ -10,13 +10,13 @@
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use backon::Retryable;
+use backon::BackoffBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 
 use super::{
-    BeforeSpawnHook, Cmd, CmdTree, Outcome, RunOutput, SingleCmd, AsyncStdinForAttempt,
-    attempt_stdin_async, combine_outcomes, finalize_outcome,
+    BeforeSpawnHook, CANCEL_POLL_INTERVAL, CancelControl, Cmd, CmdTree, Outcome, RunOutput,
+    SingleCmd, AsyncStdinForAttempt, attempt_stdin_async, combine_outcomes, finalize_outcome,
     reject_non_capture_stdout_on_spawn,
 };
 use crate::async_spawned::AsyncSpawnedProcess;
@@ -28,9 +28,11 @@ impl Cmd {
     /// Run the command (or pipeline) asynchronously, awaiting completion.
     ///
     /// Mirrors [`Cmd::run`]: all builder knobs apply (args, env, cwd,
-    /// stdin, stderr redirection, timeout, deadline, retry, secret).
-    /// `before_spawn` is currently ignored on the async path — see the
-    /// top-level README for the full async parity list.
+    /// stdin, stderr redirection, timeout, deadline, retry, secret,
+    /// before_spawn, cancel). See [`Cmd::cancel`] for cancellation
+    /// semantics — the async runner uses the same pre-flight check,
+    /// in-flight polling, retry short-circuiting, and pipeline kill-all
+    /// behaviour as the sync runner.
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub async fn run_async(mut self) -> Result<RunOutput, RunError> {
         let display = self.display();
@@ -41,16 +43,25 @@ impl Cmd {
         let stdout_mode = self.stdout_mode.clone();
         let stderr_mode = self.stderr_mode.clone();
         let before_spawn = self.before_spawn.clone();
+        let cancel = self.cancel.take();
         let tree = self.tree;
 
-        let op = || {
-            let display = &display;
-            let stdin = &stdin;
-            let stdout_mode = &stdout_mode;
-            let stderr_mode = &stderr_mode;
-            let before_spawn = before_spawn.as_ref();
-            let tree = &tree;
-            async move {
+        // Pre-flight cancel check — same semantics as sync.
+        if let Some(c) = cancel.as_ref()
+            && c.is_set()
+        {
+            return Err(RunError::Cancelled {
+                command: display,
+                stdout: Vec::new(),
+                stderr: String::new(),
+                attempts: 1,
+            });
+        }
+
+        let cancel_ref = cancel.as_ref();
+
+        match retry {
+            None => {
                 let now = Instant::now();
                 if let Some(d) = deadline
                     && now >= d
@@ -60,6 +71,7 @@ impl Cmd {
                         elapsed: Duration::ZERO,
                         stdout: Vec::new(),
                         stderr: String::new(),
+                        attempts: 1,
                     });
                 }
                 let per_attempt = match (timeout, deadline) {
@@ -68,45 +80,88 @@ impl Cmd {
                     (None, Some(d)) => Some(d.saturating_duration_since(now)),
                     (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
                 };
-                let stdin_attempt = attempt_stdin_async(stdin);
-                match tree {
-                    CmdTree::Single(s) => {
-                        execute_single_async(
-                            s,
-                            stdout_mode,
-                            stderr_mode,
-                            before_spawn,
-                            display,
-                            stdin_attempt,
-                            per_attempt,
-                        )
-                        .await
-                    }
-                    CmdTree::Pipe(_, _) => {
-                        let mut stages = Vec::new();
-                        tree.flatten(&mut stages);
-                        execute_pipeline_async(
-                            &stages,
-                            stdout_mode,
-                            stderr_mode,
-                            before_spawn,
-                            display,
-                            stdin_attempt,
-                            per_attempt,
-                        )
-                        .await
-                    }
-                }
+                run_one_attempt_async(
+                    &tree,
+                    &stdin,
+                    &stdout_mode,
+                    &stderr_mode,
+                    before_spawn.as_ref(),
+                    &display,
+                    per_attempt,
+                    cancel_ref,
+                )
+                .await
             }
-        };
-
-        match retry {
-            None => op().await,
             Some(policy) => {
                 let predicate = policy.predicate.clone();
-                op.retry(policy.backoff)
-                    .when(move |e: &RunError| predicate(e))
-                    .await
+                let mut backoff_iter = policy.backoff.build();
+                let mut attempt_no: u32 = 0;
+                loop {
+                    attempt_no = attempt_no.saturating_add(1);
+                    if let Some(c) = cancel_ref
+                        && c.is_set()
+                    {
+                        return Err(RunError::Cancelled {
+                            command: display.clone(),
+                            stdout: Vec::new(),
+                            stderr: String::new(),
+                            attempts: attempt_no,
+                        });
+                    }
+                    let now = Instant::now();
+                    if let Some(d) = deadline
+                        && now >= d
+                    {
+                        return Err(RunError::Timeout {
+                            command: display.clone(),
+                            elapsed: Duration::ZERO,
+                            stdout: Vec::new(),
+                            stderr: String::new(),
+                            attempts: attempt_no,
+                        });
+                    }
+                    let per_attempt = match (timeout, deadline) {
+                        (None, None) => None,
+                        (Some(t), None) => Some(t),
+                        (None, Some(d)) => Some(d.saturating_duration_since(now)),
+                        (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
+                    };
+                    let result = run_one_attempt_async(
+                        &tree,
+                        &stdin,
+                        &stdout_mode,
+                        &stderr_mode,
+                        before_spawn.as_ref(),
+                        &display,
+                        per_attempt,
+                        cancel_ref,
+                    )
+                    .await;
+                    match result {
+                        Ok(out) => return Ok(out),
+                        Err(err) => {
+                            if matches!(err, RunError::Cancelled { .. }) {
+                                return Err(err.with_attempts(attempt_no));
+                            }
+                            if !predicate(&err) {
+                                return Err(err.with_attempts(attempt_no));
+                            }
+                            match backoff_iter.next() {
+                                None => return Err(err.with_attempts(attempt_no)),
+                                Some(delay) => {
+                                    if cancellable_sleep_async(delay, cancel_ref).await {
+                                        return Err(RunError::Cancelled {
+                                            command: display.clone(),
+                                            stdout: Vec::new(),
+                                            stderr: String::new(),
+                                            attempts: attempt_no,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -147,6 +202,50 @@ impl Cmd {
                 )
                 .await
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_attempt_async(
+    tree: &CmdTree,
+    stdin: &Option<super::SharedStdin>,
+    stdout_mode: &Redirection,
+    stderr_mode: &Redirection,
+    before_spawn: Option<&BeforeSpawnHook>,
+    display: &CmdDisplay,
+    per_attempt: Option<Duration>,
+    cancel: Option<&CancelControl>,
+) -> Result<RunOutput, RunError> {
+    let stdin_attempt = attempt_stdin_async(stdin);
+    match tree {
+        CmdTree::Single(s) => {
+            execute_single_async(
+                s,
+                stdout_mode,
+                stderr_mode,
+                before_spawn,
+                display,
+                stdin_attempt,
+                per_attempt,
+                cancel,
+            )
+            .await
+        }
+        CmdTree::Pipe(_, _) => {
+            let mut stages = Vec::new();
+            tree.flatten(&mut stages);
+            execute_pipeline_async(
+                &stages,
+                stdout_mode,
+                stderr_mode,
+                before_spawn,
+                display,
+                stdin_attempt,
+                per_attempt,
+                cancel,
+            )
+            .await
         }
     }
 }
@@ -303,6 +402,7 @@ async fn execute_single_async(
     display: &CmdDisplay,
     stdin: AsyncStdinForAttempt,
     timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
     let mut cmd = Command::new(&single.program);
     apply_single_to_tokio_command(single, &mut cmd);
@@ -337,21 +437,7 @@ async fn execute_single_async(
     };
 
     let start = Instant::now();
-    let outcome = match timeout {
-        Some(t) => match tokio::time::timeout(t, child.wait()).await {
-            Ok(Ok(status)) => Outcome::Exited(status),
-            Ok(Err(source)) => Outcome::WaitFailed(source),
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                Outcome::TimedOut(start.elapsed())
-            }
-        },
-        None => match child.wait().await {
-            Ok(status) => Outcome::Exited(status),
-            Err(source) => Outcome::WaitFailed(source),
-        },
-    };
+    let outcome = wait_single_async_with_cancel(&mut child, timeout, cancel, start).await;
 
     let stdout_bytes = match stdout_task {
         Some(t) => t.await.unwrap_or_default(),
@@ -366,6 +452,136 @@ async fn execute_single_async(
     finalize_outcome(display, outcome, stdout_bytes, stderr_str)
 }
 
+/// Async counterpart to `wait_single_with_cancel`. Races `child.wait()`
+/// against the optional cancel flag and the optional timeout. On cancel,
+/// sends SIGTERM (Unix) and waits the grace period before sending
+/// SIGKILL; on Windows, `start_kill()` (which calls `TerminateProcess`)
+/// is invoked immediately because there's no graceful equivalent.
+async fn wait_single_async_with_cancel(
+    child: &mut Child,
+    timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
+    start: Instant,
+) -> Outcome {
+    // No cancel: fall back to the existing tokio::time::timeout shape.
+    let Some(cancel) = cancel else {
+        return match timeout {
+            Some(t) => match tokio::time::timeout(t, child.wait()).await {
+                Ok(Ok(status)) => Outcome::Exited(status),
+                Ok(Err(source)) => Outcome::WaitFailed(source),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    Outcome::TimedOut(start.elapsed())
+                }
+            },
+            None => match child.wait().await {
+                Ok(status) => Outcome::Exited(status),
+                Err(source) => Outcome::WaitFailed(source),
+            },
+        };
+    };
+
+    // With cancel active we trade event-driven wait for a 50ms polling
+    // loop: try_wait() is non-blocking, sleep between probes, check cancel
+    // and timeout each tick. Worst-case 50ms latency on exit detection —
+    // negligible for any realistic workload, and the alternative
+    // (tokio::select! with a borrowed wait future) fights the borrow
+    // checker because the kill paths also need &mut Child.
+    let pid = child.id();
+    loop {
+        if cancel.is_set() {
+            kill_async_with_grace(child, pid, cancel.grace).await;
+            return Outcome::Cancelled;
+        }
+        if let Some(t) = timeout
+            && start.elapsed() >= t
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Outcome::TimedOut(start.elapsed());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Outcome::Exited(status),
+            Ok(None) => {
+                let step = match timeout {
+                    None => CANCEL_POLL_INTERVAL,
+                    Some(t) => CANCEL_POLL_INTERVAL.min(t.saturating_sub(start.elapsed())),
+                };
+                if !step.is_zero() {
+                    tokio::time::sleep(step).await;
+                }
+            }
+            Err(source) => return Outcome::WaitFailed(source),
+        }
+    }
+}
+
+/// Send SIGTERM (Unix), wait the grace period, then SIGKILL. Windows
+/// kills immediately — `TerminateProcess` has no graceful counterpart.
+#[cfg(unix)]
+async fn kill_async_with_grace(child: &mut Child, pid: Option<u32>, grace: Duration) {
+    // Skip SIGTERM if pid is missing (child already reaped) or doesn't
+    // fit i32 — same rationale as the sync `kill_with_grace`.
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) {
+        // SAFETY: same as sync kill_with_grace — pure syscall, ESRCH-tolerant.
+        unsafe {
+            libc_kill_async(pid, SIGTERM_ASYNC);
+        }
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let step = CANCEL_POLL_INTERVAL.min(remaining);
+                    tokio::time::sleep(step).await;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn kill_async_with_grace(child: &mut Child, _pid: Option<u32>, _grace: Duration) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+const SIGTERM_ASYNC: i32 = 15;
+
+// Same extern declaration as the sync side. We have to redeclare here
+// instead of importing because extern statics aren't pub by default; a
+// duplicate declaration is harmless (resolves to the same libc symbol).
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill_async(pid: i32, sig: i32) -> i32;
+}
+
+/// Async counterpart to `cancellable_sleep` — sleep `delay` but return
+/// early (with `true`) if the cancel flag fires during the sleep.
+async fn cancellable_sleep_async(delay: Duration, cancel: Option<&CancelControl>) -> bool {
+    let Some(c) = cancel else {
+        tokio::time::sleep(delay).await;
+        return false;
+    };
+    let deadline = tokio::time::Instant::now() + delay;
+    while tokio::time::Instant::now() < deadline {
+        if c.is_set() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let step = CANCEL_POLL_INTERVAL.min(remaining);
+        tokio::time::sleep(step).await;
+    }
+    c.is_set()
+}
+
 async fn execute_pipeline_async(
     stages: &[&SingleCmd],
     stdout_mode: &Redirection,
@@ -374,6 +590,7 @@ async fn execute_pipeline_async(
     display: &CmdDisplay,
     stdin: AsyncStdinForAttempt,
     timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
     debug_assert!(stages.len() >= 2);
 
@@ -449,32 +666,32 @@ async fn execute_pipeline_async(
     let start = Instant::now();
     let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
 
-    if let Some(budget) = timeout {
-        for child in children.iter_mut() {
-            let remaining = budget.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                per_stage_status.push(Outcome::TimedOut(start.elapsed()));
-                continue;
-            }
-            match tokio::time::timeout(remaining, child.wait()).await {
-                Ok(Ok(status)) => per_stage_status.push(Outcome::Exited(status)),
-                Ok(Err(source)) => per_stage_status.push(Outcome::WaitFailed(source)),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    per_stage_status.push(Outcome::TimedOut(start.elapsed()));
+    for i in 0..children.len() {
+        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
+            let _ = children[i].kill().await;
+            let _ = children[i].wait().await;
+            per_stage_status.push(Outcome::Cancelled);
+            continue;
+        }
+        let stage_start = Instant::now();
+        let per_stage_timeout =
+            timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome = wait_single_async_with_cancel(
+            &mut children[i],
+            per_stage_timeout,
+            cancel,
+            stage_start,
+        )
+        .await;
+        if matches!(stage_outcome, Outcome::Cancelled) {
+            for (j, c) in children.iter_mut().enumerate() {
+                if j != i {
+                    let _ = c.kill().await;
+                    let _ = c.wait().await;
                 }
             }
         }
-    } else {
-        for child in children.iter_mut() {
-            match child.wait().await {
-                Ok(status) => per_stage_status.push(Outcome::Exited(status)),
-                Err(source) => per_stage_status.push(Outcome::WaitFailed(source)),
-            }
-        }
+        per_stage_status.push(stage_outcome);
     }
 
     let stdout_bytes = match stdout_task {

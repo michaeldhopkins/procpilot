@@ -39,11 +39,12 @@ use std::io::{self, Read, Write};
 use std::ops::BitOr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use backon::BlockingRetryable;
+use backon::BackoffBuilder;
 use os_pipe::PipeReader;
 use shared_child::SharedChild;
 use wait_timeout::ChildExt;
@@ -195,6 +196,34 @@ pub struct Cmd {
     retry: Option<RetryPolicy>,
     before_spawn: Option<BeforeSpawnHook>,
     secret: bool,
+    cancel: Option<CancelControl>,
+}
+
+/// Internal bundle for caller-driven cancellation.
+///
+/// Holds the shared flag the caller toggles plus the grace duration between
+/// SIGTERM and SIGKILL (Unix). Constructed via [`Cmd::cancel`] and tweaked
+/// via [`Cmd::cancel_grace`].
+#[derive(Clone)]
+pub(crate) struct CancelControl {
+    pub(crate) flag: Arc<AtomicBool>,
+    pub(crate) grace: Duration,
+}
+
+/// Default grace period between SIGTERM and SIGKILL after a cancellation
+/// signal on Unix. Windows kills immediately — `TerminateProcess` has no
+/// graceful equivalent.
+pub(crate) const DEFAULT_CANCEL_GRACE: Duration = Duration::from_millis(500);
+
+/// Polling cadence for cancellation checks during a running attempt and
+/// during retry-loop backoff. Small enough that "press q and quit" feels
+/// snappy, large enough that the poll loop doesn't burn CPU.
+pub(crate) const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+impl CancelControl {
+    pub(crate) fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
 }
 
 /// Cloneable internal wrapper around [`StdinData`].
@@ -204,7 +233,7 @@ pub struct Cmd {
 /// share a `Mutex<Option<…>>` — whichever attempt runs first takes the
 /// reader; subsequent attempts (or concurrent clones) see `None`.
 #[derive(Clone)]
-enum SharedStdin {
+pub(crate) enum SharedStdin {
     Bytes(Arc<Vec<u8>>),
     Reader(Arc<Mutex<Option<Box<dyn Read + Send>>>>),
     #[cfg(feature = "tokio")]
@@ -311,6 +340,7 @@ impl fmt::Debug for Cmd {
             .field("deadline", &self.deadline)
             .field("retry", &self.retry)
             .field("secret", &self.secret)
+            .field("cancel", &self.cancel.is_some())
             .finish()
     }
 }
@@ -328,6 +358,7 @@ impl Cmd {
             retry: None,
             before_spawn: None,
             secret: false,
+            cancel: None,
         }
     }
 
@@ -361,6 +392,7 @@ impl Cmd {
             before_spawn: self.before_spawn,
             // Propagate secret if either side set it — leaking is worse than over-redaction.
             secret: self.secret || next.secret,
+            cancel: self.cancel,
         }
     }
 
@@ -531,6 +563,107 @@ impl Cmd {
         F: Fn(&mut Command) -> io::Result<()> + Send + Sync + 'static,
     {
         self.before_spawn = Some(Arc::new(hook));
+        self
+    }
+
+    /// Cancel this command if `flag` becomes `true` during execution.
+    ///
+    /// This is the escape hatch for "stop *now*" — useful for TUI quit,
+    /// debounced refreshes, or any case where wall-clock timeout is the
+    /// wrong tool because either too-short kills legitimate slow work or
+    /// too-long makes the UI feel laggy.
+    ///
+    /// # Composition
+    ///
+    /// - **With [`timeout`](Self::timeout) / [`deadline`](Self::deadline)**:
+    ///   the first wakeup (cancellation, timeout, or process exit) wins.
+    /// - **With [`retry`](Self::retry)**: when the flag fires the retry
+    ///   loop stops immediately and any pending backoff sleep is
+    ///   short-circuited; the call returns with the most recent in-flight
+    ///   attempt killed and tagged as
+    ///   [`RunError::Cancelled`](crate::RunError::Cancelled).
+    /// - **With pipelines**: every stage is killed.
+    ///
+    /// # Pre-flight check
+    ///
+    /// If `flag` is already `true` when [`run`](Self::run) /
+    /// [`run_async`](Self::run_async) is called, the command **returns
+    /// `Cancelled` immediately without spawning anything**. Rationale:
+    /// callers in a "we're shutting down" state should not pay process
+    /// startup cost only to kill it microseconds later. The returned
+    /// error carries empty `stdout`/`stderr` and `attempts == 1`.
+    ///
+    /// # Polling
+    ///
+    /// The flag is polled at a fixed 50ms cadence both **during** an
+    /// in-flight attempt (so a kill triggered mid-execution is honored
+    /// without waiting for the next retry boundary) and **between**
+    /// retries (replacing the backoff sleep with a cancellable wait).
+    ///
+    /// # Platform behavior
+    ///
+    /// - **Unix**: `SIGTERM` is sent on cancel, followed by `SIGKILL`
+    ///   after the grace period (see [`cancel_grace`](Self::cancel_grace),
+    ///   default 500ms).
+    /// - **Windows**: `TerminateProcess` is invoked immediately. There is
+    ///   no graceful equivalent, so the grace setting is ignored on this
+    ///   platform.
+    ///
+    /// # Why `Arc<AtomicBool>`
+    ///
+    /// Composes with any existing cancellation primitive — `tokio_util::sync::CancellationToken`
+    /// via `token.is_cancelled()`, a hand-rolled flag, a `Notify`, etc.
+    /// No new types in procpilot's public surface.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    /// use procpilot::{Cmd, RunError};
+    ///
+    /// let cancel = Arc::new(AtomicBool::new(false));
+    /// let cancel_clone = Arc::clone(&cancel);
+    ///
+    /// // Background thread or UI handler sets the flag on user quit:
+    /// std::thread::spawn(move || {
+    ///     // ... wait for `q` keypress ...
+    ///     cancel_clone.store(true, Ordering::Relaxed);
+    /// });
+    ///
+    /// match Cmd::new("jj").args(["log", "-r", "all()"])
+    ///     .cancel(cancel)
+    ///     .run()
+    /// {
+    ///     Ok(out) => { /* finished before quit */ }
+    ///     Err(RunError::Cancelled { .. }) => { /* user quit — exit cleanly */ }
+    ///     Err(e) => return Err(e.into()),
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn cancel(mut self, flag: Arc<AtomicBool>) -> Self {
+        let grace = self
+            .cancel
+            .as_ref()
+            .map(|c| c.grace)
+            .unwrap_or(DEFAULT_CANCEL_GRACE);
+        self.cancel = Some(CancelControl { flag, grace });
+        self
+    }
+
+    /// Override the SIGTERM → SIGKILL grace period for [`cancel`](Self::cancel).
+    ///
+    /// Default is 500ms. Has no effect on Windows (`TerminateProcess` is
+    /// immediate). Has no effect if [`cancel`](Self::cancel) was not also
+    /// set on this pipeline — debug builds will assert this misuse.
+    pub fn cancel_grace(mut self, grace: Duration) -> Self {
+        debug_assert!(
+            self.cancel.is_some(),
+            ".cancel_grace() called without a preceding .cancel(flag); the grace value will be ignored",
+        );
+        if let Some(c) = self.cancel.as_mut() {
+            c.grace = grace;
+        }
         self
     }
 
@@ -743,7 +876,23 @@ impl Cmd {
         // a later `run_async` on a clone.
         reject_async_stdin_on_sync(stdin.as_ref(), &display)?;
         let retry = self.retry.take();
+        let cancel = self.cancel.take();
 
+        // Pre-flight: if cancellation is already requested before we spawn,
+        // skip the work entirely. Documented behaviour — callers in a
+        // "we're shutting down" state should not pay process startup cost.
+        if let Some(c) = cancel.as_ref()
+            && c.is_set()
+        {
+            return Err(RunError::Cancelled {
+                command: display,
+                stdout: Vec::new(),
+                stderr: String::new(),
+                attempts: 1,
+            });
+        }
+
+        let cancel_ref = cancel.as_ref();
         let op = |stdin_attempt: SyncStdinForAttempt, per_attempt: Option<Duration>| match &self
             .tree
         {
@@ -755,6 +904,7 @@ impl Cmd {
                 &display,
                 stdin_attempt,
                 per_attempt,
+                cancel_ref,
             ),
             CmdTree::Pipe(_, _) => {
                 let mut stages = Vec::new();
@@ -767,6 +917,7 @@ impl Cmd {
                     &display,
                     stdin_attempt,
                     per_attempt,
+                    cancel_ref,
                 )
             }
         };
@@ -782,6 +933,7 @@ impl Cmd {
                 self.timeout,
                 self.deadline,
                 &display,
+                cancel_ref,
                 &op,
             ),
         }
@@ -817,13 +969,32 @@ fn run_with_retry<F>(
     timeout: Option<Duration>,
     deadline: Option<Instant>,
     display: &CmdDisplay,
+    cancel: Option<&CancelControl>,
     op: &F,
 ) -> Result<RunOutput, RunError>
 where
     F: Fn(SyncStdinForAttempt, Option<Duration>) -> Result<RunOutput, RunError>,
 {
     let predicate = policy.predicate.clone();
-    let attempt = || {
+    let mut backoff_iter = policy.backoff.build();
+    let mut attempt_no: u32 = 0;
+
+    loop {
+        attempt_no = attempt_no.saturating_add(1);
+
+        // Pre-attempt cancel check — covers both "flag set before we
+        // started" and "flag set during a backoff sleep we just woke from".
+        if let Some(c) = cancel
+            && c.is_set()
+        {
+            return Err(RunError::Cancelled {
+                command: display.clone(),
+                stdout: Vec::new(),
+                stderr: String::new(),
+                attempts: attempt_no,
+            });
+        }
+
         let now = Instant::now();
         if let Some(d) = deadline
             && now >= d
@@ -833,6 +1004,7 @@ where
                 elapsed: Duration::ZERO,
                 stdout: Vec::new(),
                 stderr: String::new(),
+                attempts: attempt_no,
             });
         }
         let per_attempt = match (timeout, deadline) {
@@ -841,12 +1013,58 @@ where
             (None, Some(d)) => Some(d.saturating_duration_since(now)),
             (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
         };
-        op(attempt_stdin_sync(stdin), per_attempt)
+
+        let result = op(attempt_stdin_sync(stdin), per_attempt);
+        match result {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                // Cancellation always wins over retry — the caller said
+                // stop, so we stop. Don't try again even if the predicate
+                // would say "transient".
+                if matches!(err, RunError::Cancelled { .. }) {
+                    return Err(err.with_attempts(attempt_no));
+                }
+                if !predicate(&err) {
+                    return Err(err.with_attempts(attempt_no));
+                }
+                match backoff_iter.next() {
+                    None => return Err(err.with_attempts(attempt_no)),
+                    Some(delay) => {
+                        if cancellable_sleep(delay, cancel) {
+                            // Flag fired during backoff — drop the in-hand
+                            // error, return Cancelled tagged with the
+                            // attempt number that just failed.
+                            return Err(RunError::Cancelled {
+                                command: display.clone(),
+                                stdout: Vec::new(),
+                                stderr: String::new(),
+                                attempts: attempt_no,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sleep `delay`, polling the cancel flag (if any) at the
+/// [`CANCEL_POLL_INTERVAL`] cadence. Returns `true` if the flag fired
+/// before the full delay elapsed.
+fn cancellable_sleep(delay: Duration, cancel: Option<&CancelControl>) -> bool {
+    let Some(c) = cancel else {
+        thread::sleep(delay);
+        return false;
     };
-    attempt
-        .retry(policy.backoff)
-        .when(move |e: &RunError| predicate(e))
-        .call()
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if c.is_set() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(CANCEL_POLL_INTERVAL.min(remaining));
+    }
+    c.is_set()
 }
 
 pub(crate) enum SyncStdinForAttempt {
@@ -906,6 +1124,7 @@ enum Outcome {
     Exited(ExitStatus),
     TimedOut(Duration),
     WaitFailed(io::Error),
+    Cancelled,
 }
 
 /// Apply stdout routing. Used by the `run` path; the `spawn` path always
@@ -991,6 +1210,7 @@ fn execute_single(
     display: &CmdDisplay,
     stdin: SyncStdinForAttempt,
     timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
     let mut cmd = Command::new(&single.program);
     single.apply_to(&mut cmd);
@@ -1031,25 +1251,7 @@ fn execute_single(
     };
 
     let start = Instant::now();
-    let outcome = match timeout {
-        Some(t) => match child.wait_timeout(t) {
-            Ok(Some(status)) => Outcome::Exited(status),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Outcome::TimedOut(start.elapsed())
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Outcome::WaitFailed(e)
-            }
-        },
-        None => match child.wait() {
-            Ok(status) => Outcome::Exited(status),
-            Err(e) => Outcome::WaitFailed(e),
-        },
-    };
+    let outcome = wait_single_with_cancel(&mut child, timeout, cancel, start);
 
     if let Some(t) = stdin_thread {
         let _ = t.join();
@@ -1063,6 +1265,122 @@ fn execute_single(
     let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
 
     finalize_outcome(display, outcome, stdout_bytes, stderr_str)
+}
+
+/// Wait for a single child, polling both timeout and the optional cancel
+/// flag at the [`CANCEL_POLL_INTERVAL`] cadence. On cancel: SIGTERM, sleep
+/// the grace duration (Unix) or skip the grace (Windows), then SIGKILL.
+fn wait_single_with_cancel(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
+    start: Instant,
+) -> Outcome {
+    // Fast path: no cancel and no timeout — block on wait().
+    if cancel.is_none() && timeout.is_none() {
+        return match child.wait() {
+            Ok(status) => Outcome::Exited(status),
+            Err(e) => Outcome::WaitFailed(e),
+        };
+    }
+
+    // Fast path: no cancel but timeout set — use the existing wait_timeout.
+    if cancel.is_none()
+        && let Some(t) = timeout
+    {
+        return match child.wait_timeout(t) {
+            Ok(Some(status)) => Outcome::Exited(status),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Outcome::TimedOut(start.elapsed())
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Outcome::WaitFailed(e)
+            }
+        };
+    }
+
+    // Cancel is set — poll at CANCEL_POLL_INTERVAL.
+    let cancel = cancel.expect("cancel branch");
+    loop {
+        if cancel.is_set() {
+            kill_with_grace(child, cancel.grace);
+            return Outcome::Cancelled;
+        }
+        let remaining = match timeout {
+            None => CANCEL_POLL_INTERVAL,
+            Some(t) => {
+                let elapsed = start.elapsed();
+                if elapsed >= t {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Outcome::TimedOut(elapsed);
+                }
+                CANCEL_POLL_INTERVAL.min(t - elapsed)
+            }
+        };
+        match child.wait_timeout(remaining) {
+            Ok(Some(status)) => return Outcome::Exited(status),
+            Ok(None) => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Outcome::WaitFailed(e);
+            }
+        }
+    }
+}
+
+/// Send SIGTERM (Unix) and then SIGKILL after `grace`. Windows kills
+/// immediately — `TerminateProcess` has no graceful counterpart. The
+/// final `wait()` reaps the process to avoid leaving a zombie.
+#[cfg(unix)]
+fn kill_with_grace(child: &mut std::process::Child, grace: Duration) {
+    // Skip the SIGTERM stage if the pid doesn't fit in i32 (extremely
+    // unusual — would require `kernel.pid_max >= 2^31`); fall straight
+    // to SIGKILL instead of risking a kill(2) on the wrong pid.
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: calling `kill(2)` with a valid pid + signal is safe; an
+        // already-exited pid returns -1/ESRCH which we ignore. No memory
+        // safety hazard — this is purely a syscall.
+        unsafe {
+            libc_kill(pid, SIGTERM);
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(CANCEL_POLL_INTERVAL.min(remaining));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_with_grace(child: &mut std::process::Child, _grace: Duration) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+// Thin extern declaration for `kill(2)`. The symbol is in libc, which Rust
+// links by default on Unix; declaring it ourselves avoids pulling the libc
+// crate in for a single syscall.
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn finalize_outcome(
@@ -1081,16 +1399,24 @@ fn finalize_outcome(
             status,
             stdout: truncate_suffix(stdout_bytes),
             stderr: truncate_suffix_string(stderr_str),
+            attempts: 1,
         }),
         Outcome::TimedOut(elapsed) => Err(RunError::Timeout {
             command: display.clone(),
             elapsed,
             stdout: truncate_suffix(stdout_bytes),
             stderr: truncate_suffix_string(stderr_str),
+            attempts: 1,
         }),
         Outcome::WaitFailed(source) => Err(RunError::Spawn {
             command: display.clone(),
             source,
+        }),
+        Outcome::Cancelled => Err(RunError::Cancelled {
+            command: display.clone(),
+            stdout: truncate_suffix(stdout_bytes),
+            stderr: truncate_suffix_string(stderr_str),
+            attempts: 1,
         }),
     }
 }
@@ -1153,6 +1479,7 @@ fn execute_pipeline(
     display: &CmdDisplay,
     stdin: SyncStdinForAttempt,
     timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
     debug_assert!(stages.len() >= 2);
 
@@ -1252,36 +1579,34 @@ fn execute_pipeline(
     let start = Instant::now();
     let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
 
-    if let Some(budget) = timeout {
-        for child in children.iter_mut() {
-            let remaining = budget.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                let _ = child.kill();
-                let _ = child.wait();
-                per_stage_status.push(Outcome::TimedOut(start.elapsed()));
-                continue;
-            }
-            match child.wait_timeout(remaining) {
-                Ok(Some(status)) => per_stage_status.push(Outcome::Exited(status)),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    per_stage_status.push(Outcome::TimedOut(start.elapsed()));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    per_stage_status.push(Outcome::WaitFailed(e));
+    for i in 0..children.len() {
+        // If cancellation already fired on a prior stage, kill the rest
+        // and mark them cancelled — no point waiting on them.
+        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
+            let _ = children[i].kill();
+            let _ = children[i].wait();
+            per_stage_status.push(Outcome::Cancelled);
+            continue;
+        }
+        let stage_start = Instant::now();
+        let per_stage_timeout =
+            timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome = wait_single_with_cancel(
+            &mut children[i],
+            per_stage_timeout,
+            cancel,
+            stage_start,
+        );
+        if matches!(stage_outcome, Outcome::Cancelled) {
+            // Kill every other stage right away so they don't continue running.
+            for (j, c) in children.iter_mut().enumerate() {
+                if j != i {
+                    let _ = c.kill();
+                    let _ = c.wait();
                 }
             }
         }
-    } else {
-        for child in children.iter_mut() {
-            match child.wait() {
-                Ok(status) => per_stage_status.push(Outcome::Exited(status)),
-                Err(e) => per_stage_status.push(Outcome::WaitFailed(e)),
-            }
-        }
+        per_stage_status.push(stage_outcome);
     }
 
     if let Some(t) = stdin_thread {
@@ -1303,7 +1628,14 @@ fn execute_pipeline(
 
 /// Duct-style pipefail: any non-success trumps success; the rightmost
 /// non-success wins. All-success returns the first exit status.
+///
+/// Cancellation is special-cased: if *any* stage was cancelled, the whole
+/// pipeline is reported as cancelled — the user asked to stop and we did,
+/// regardless of what else any stage did.
 fn combine_outcomes(outcomes: Vec<Outcome>) -> Outcome {
+    if outcomes.iter().any(|o| matches!(o, Outcome::Cancelled)) {
+        return Outcome::Cancelled;
+    }
     let mut chosen: Option<Outcome> = None;
     for o in outcomes.into_iter() {
         match &o {

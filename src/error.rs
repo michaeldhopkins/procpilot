@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use crate::cmd_display::CmdDisplay;
 
-/// Maximum bytes of stdout/stderr retained on `NonZeroExit` and `Timeout`
-/// error variants. Anything beyond this is dropped from the front (FIFO),
-/// keeping the most recent output — usually the most relevant for debugging.
+/// Maximum bytes of stdout/stderr retained on `NonZeroExit`, `Timeout`, and
+/// `Cancelled` error variants. Anything beyond this is dropped from the front
+/// (FIFO), keeping the most recent output — usually the most relevant for
+/// debugging.
 pub const STREAM_SUFFIX_SIZE: usize = 128 * 1024;
 
 /// Error type for subprocess execution.
@@ -16,14 +17,26 @@ pub const STREAM_SUFFIX_SIZE: usize = 128 * 1024;
 /// - [`Spawn`](Self::Spawn): infrastructure failure (binary missing, fork failed, etc.)
 /// - [`NonZeroExit`](Self::NonZeroExit): the command ran and reported failure via exit code
 /// - [`Timeout`](Self::Timeout): the command was killed after exceeding its timeout
+/// - [`Cancelled`](Self::Cancelled): the caller signaled cancellation via
+///   [`Cmd::cancel`](crate::Cmd::cancel)
 ///
 /// All variants carry a [`CmdDisplay`] that formats the command shell-style
 /// for logging (with secret redaction if the command was marked `.secret()`).
 ///
-/// `NonZeroExit` and `Timeout` variants carry the **last 128 KiB** of stdout
-/// and stderr (capped by [`STREAM_SUFFIX_SIZE`]) — enough context to debug
-/// most failures, bounded so a runaway process can't blow up your error
+/// `NonZeroExit`, `Timeout`, and `Cancelled` variants carry the **last 128 KiB**
+/// of stdout and stderr (capped by [`STREAM_SUFFIX_SIZE`]) — enough context to
+/// debug most failures, bounded so a runaway process can't blow up your error
 /// path's memory.
+///
+/// # Attempt count
+///
+/// `NonZeroExit`, `Timeout`, and `Cancelled` carry an `attempts` field
+/// (read via [`attempts`](Self::attempts)) — the 1-based index of the attempt
+/// on which this error occurred. For a `Cmd` without [`retry`](crate::Cmd::retry),
+/// this is always 1. For a retried command, it tells the caller how many tries
+/// happened before the final error (e.g. `attempts == 3` on a default policy
+/// means the retry budget was exhausted). `Spawn` doesn't carry it because
+/// `Spawn` failures by default don't trigger retries.
 ///
 /// Marked `#[non_exhaustive]` so future variants can be added without
 /// breaking callers. Match with a wildcard arm to handle unknown variants
@@ -50,21 +63,38 @@ pub enum RunError {
     },
     /// The child process ran but exited non-zero. `stdout`/`stderr` carry
     /// the last [`STREAM_SUFFIX_SIZE`] bytes captured before exit (empty
-    /// for inherited stderr/stdout).
+    /// for inherited stderr/stdout). `attempts` is the 1-based retry
+    /// attempt on which this failure occurred (1 if `.retry()` was not set).
     NonZeroExit {
         command: CmdDisplay,
         status: ExitStatus,
         stdout: Vec<u8>,
         stderr: String,
+        attempts: u32,
     },
     /// The child process was killed after exceeding the caller's timeout.
     /// `elapsed` records how long the process ran. `stdout`/`stderr` carry
-    /// any output collected before the kill signal.
+    /// any output collected before the kill signal. `attempts` is the
+    /// 1-based retry attempt on which the timeout fired.
     Timeout {
         command: CmdDisplay,
         elapsed: Duration,
         stdout: Vec<u8>,
         stderr: String,
+        attempts: u32,
+    },
+    /// The caller signaled cancellation via [`Cmd::cancel`](crate::Cmd::cancel).
+    /// The child was killed (`SIGTERM`, then `SIGKILL` after the grace
+    /// period on Unix; immediate `TerminateProcess` on Windows).
+    /// `stdout`/`stderr` carry any output captured before the kill.
+    /// `attempts` is the 1-based retry attempt that was in flight when
+    /// cancellation fired; if the flag was already set before the first
+    /// spawn, `attempts == 1` and the captured streams are empty.
+    Cancelled {
+        command: CmdDisplay,
+        stdout: Vec<u8>,
+        stderr: String,
+        attempts: u32,
     },
 }
 
@@ -76,6 +106,7 @@ impl RunError {
             Self::Spawn { command, .. } => command,
             Self::NonZeroExit { command, .. } => command,
             Self::Timeout { command, .. } => command,
+            Self::Cancelled { command, .. } => command,
         }
     }
 
@@ -94,6 +125,7 @@ impl RunError {
         match self {
             Self::NonZeroExit { stderr, .. } => Some(stderr),
             Self::Timeout { stderr, .. } => Some(stderr),
+            Self::Cancelled { stderr, .. } => Some(stderr),
             Self::Spawn { .. } => None,
         }
     }
@@ -103,16 +135,33 @@ impl RunError {
         match self {
             Self::NonZeroExit { stdout, .. } => Some(stdout),
             Self::Timeout { stdout, .. } => Some(stdout),
+            Self::Cancelled { stdout, .. } => Some(stdout),
             Self::Spawn { .. } => None,
         }
     }
 
     /// The exit status, if the process actually ran to completion.
-    /// None for spawn failures and timeouts.
+    /// None for spawn failures, timeouts, and cancellations.
     pub fn exit_status(&self) -> Option<ExitStatus> {
         match self {
             Self::NonZeroExit { status, .. } => Some(*status),
-            Self::Spawn { .. } | Self::Timeout { .. } => None,
+            Self::Spawn { .. } | Self::Timeout { .. } | Self::Cancelled { .. } => None,
+        }
+    }
+
+    /// The 1-based retry attempt number on which this error occurred.
+    ///
+    /// Always 1 for `Spawn` (spawn failures don't trigger retries by
+    /// default; this method returns 1 rather than `Option<u32>` to keep
+    /// the API ergonomic). For `NonZeroExit`/`Timeout`/`Cancelled`, this
+    /// is the attempt on which the failure occurred — e.g. 3 on a default
+    /// `RetryPolicy` means the retry budget was fully consumed.
+    pub fn attempts(&self) -> u32 {
+        match self {
+            Self::Spawn { .. } => 1,
+            Self::NonZeroExit { attempts, .. } => *attempts,
+            Self::Timeout { attempts, .. } => *attempts,
+            Self::Cancelled { attempts, .. } => *attempts,
         }
     }
 
@@ -129,6 +178,25 @@ impl RunError {
     /// Whether this error represents a timeout (process killed after exceeding its time budget).
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout { .. })
+    }
+
+    /// Whether this error represents caller-driven cancellation via
+    /// [`Cmd::cancel`](crate::Cmd::cancel).
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled { .. })
+    }
+
+    /// Stamp this error with the attempt number it was produced on.
+    /// Used by the retry loop to backfill `attempts` after the operation
+    /// returns. No-op for `Spawn`.
+    pub(crate) fn with_attempts(mut self, n: u32) -> Self {
+        match &mut self {
+            Self::NonZeroExit { attempts, .. }
+            | Self::Timeout { attempts, .. }
+            | Self::Cancelled { attempts, .. } => *attempts = n,
+            Self::Spawn { .. } => {}
+        }
+        self
     }
 }
 
@@ -172,6 +240,19 @@ impl fmt::Display for RunError {
                     )
                 }
             }
+            Self::Cancelled {
+                command, stderr, ..
+            } => {
+                let trimmed = stderr.trim();
+                if trimmed.is_empty() {
+                    write!(f, "`{command}` cancelled by caller")
+                } else {
+                    write!(
+                        f,
+                        "`{command}` cancelled by caller; last stderr: {trimmed}"
+                    )
+                }
+            }
         }
     }
 }
@@ -180,7 +261,7 @@ impl std::error::Error for RunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Spawn { source, .. } => Some(source),
-            Self::NonZeroExit { .. } | Self::Timeout { .. } => None,
+            Self::NonZeroExit { .. } | Self::Timeout { .. } | Self::Cancelled { .. } => None,
         }
     }
 }
@@ -245,6 +326,7 @@ mod tests {
             status,
             stdout: Vec::new(),
             stderr: stderr.to_string(),
+            attempts: 1,
         }
     }
 
@@ -254,6 +336,16 @@ mod tests {
             elapsed: Duration::from_secs(30),
             stdout: Vec::new(),
             stderr: "Fetching origin".into(),
+            attempts: 1,
+        }
+    }
+
+    fn cancelled_error() -> RunError {
+        RunError::Cancelled {
+            command: cd("git", &["log"]),
+            stdout: Vec::new(),
+            stderr: "Working".into(),
+            attempts: 1,
         }
     }
 
@@ -262,20 +354,23 @@ mod tests {
         assert_eq!(spawn_error().program(), std::ffi::OsStr::new("git"));
         assert_eq!(non_zero_exit("").program(), std::ffi::OsStr::new("git"));
         assert_eq!(timeout_error().program(), std::ffi::OsStr::new("git"));
+        assert_eq!(cancelled_error().program(), std::ffi::OsStr::new("git"));
     }
 
     #[test]
-    fn stderr_only_for_completed_or_timed_out() {
+    fn stderr_only_for_completed_or_killed() {
         assert_eq!(spawn_error().stderr(), None);
         assert_eq!(non_zero_exit("boom").stderr(), Some("boom"));
         assert_eq!(timeout_error().stderr(), Some("Fetching origin"));
+        assert_eq!(cancelled_error().stderr(), Some("Working"));
     }
 
     #[test]
-    fn stdout_only_for_completed_or_timed_out() {
+    fn stdout_only_for_completed_or_killed() {
         assert!(spawn_error().stdout().is_none());
         assert!(non_zero_exit("").stdout().is_some());
         assert!(timeout_error().stdout().is_some());
+        assert!(cancelled_error().stdout().is_some());
     }
 
     #[test]
@@ -283,6 +378,7 @@ mod tests {
         assert!(spawn_error().exit_status().is_none());
         assert!(non_zero_exit("").exit_status().is_some());
         assert!(timeout_error().exit_status().is_none());
+        assert!(cancelled_error().exit_status().is_none());
     }
 
     #[test]
@@ -290,6 +386,28 @@ mod tests {
         assert!(spawn_error().is_spawn_failure());
         assert!(non_zero_exit("").is_non_zero_exit());
         assert!(timeout_error().is_timeout());
+        assert!(cancelled_error().is_cancelled());
+    }
+
+    #[test]
+    fn attempts_default_to_one() {
+        assert_eq!(spawn_error().attempts(), 1);
+        assert_eq!(non_zero_exit("").attempts(), 1);
+        assert_eq!(timeout_error().attempts(), 1);
+        assert_eq!(cancelled_error().attempts(), 1);
+    }
+
+    #[test]
+    fn with_attempts_sets_value_on_retry_aware_variants() {
+        assert_eq!(non_zero_exit("").with_attempts(3).attempts(), 3);
+        assert_eq!(timeout_error().with_attempts(5).attempts(), 5);
+        assert_eq!(cancelled_error().with_attempts(2).attempts(), 2);
+    }
+
+    #[test]
+    fn with_attempts_noop_on_spawn() {
+        // Spawn doesn't track attempts; with_attempts must not change it.
+        assert_eq!(spawn_error().with_attempts(7).attempts(), 1);
     }
 
     #[test]
@@ -314,6 +432,13 @@ mod tests {
     }
 
     #[test]
+    fn display_cancelled() {
+        let msg = format!("{}", cancelled_error());
+        assert!(msg.contains("git log"));
+        assert!(msg.contains("cancelled"));
+    }
+
+    #[test]
     fn error_source_for_spawn() {
         use std::error::Error;
         assert!(spawn_error().source().is_some());
@@ -324,6 +449,7 @@ mod tests {
         use std::error::Error;
         assert!(non_zero_exit("").source().is_none());
         assert!(timeout_error().source().is_none());
+        assert!(cancelled_error().source().is_none());
     }
 
     #[test]
