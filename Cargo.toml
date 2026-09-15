@@ -86,6 +86,11 @@ name = "pp_child_grandchild"
 path = "src/bin/pp_child_grandchild.rs"
 required-features = ["mock-binaries"]
 
+[[bin]]
+name = "pp_arg0"
+path = "src/bin/pp_arg0.rs"
+required-features = ["mock-binaries"]
+
 # Integration test that depends on the mock binaries. Skipped when
 # `mock-binaries` is off so `cargo test` (without feature flag) still
 # works for unit tests.
@@ -102,6 +107,11 @@ required-features = ["mock-binaries"]
 [[test]]
 name = "pipeline"
 path = "tests/pipeline.rs"
+required-features = ["mock-binaries"]
+
+[[test]]
+name = "program_resolution"
+path = "tests/program_resolution.rs"
 required-features = ["mock-binaries"]
 
 [[test]]
@@ -125,8 +135,14 @@ shared_child = "1.1.1"
 tokio = { version = "1", features = ["process", "io-util", "rt", "time", "sync", "macros"], optional = true }
 wait-timeout = "0.2"
 
+# libc: `faccessat` for the PATH search in src/cmd/program.rs, which checks a candidate is
+# executable by this process's effective ids as exec will. Already in the tree through os_pipe.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
+proptest = "1"
 # syn + proc-macro2: tests/file_length.rs parses the crate's own source to leave inline tests out
 # of each file's count; a text scan is fooled by strings and comments. `span-locations` gives it
 # exact line spans.

@@ -404,7 +404,7 @@ async fn execute_single_async(
     timeout: Option<Duration>,
     cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
-    let mut cmd = Command::new(&single.program);
+    let mut cmd = Command::from(single.program_command());
     apply_single_to_tokio_command(single, &mut cmd);
     let piped_stdin = !matches!(stdin, AsyncStdinForAttempt::None);
     if piped_stdin {
@@ -610,7 +610,7 @@ async fn execute_pipeline_async(
     let mut stdin_for_feed = Some(stdin);
 
     for (i, stage) in stages.iter().enumerate() {
-        let mut cmd = Command::new(&stage.program);
+        let mut cmd = Command::from(stage.program_command());
         apply_single_to_tokio_command(stage, &mut cmd);
 
         if i == 0 {
@@ -715,7 +715,7 @@ async fn spawn_single_async(
     stdin: AsyncStdinForAttempt,
     display: CmdDisplay,
 ) -> Result<AsyncSpawnedProcess, RunError> {
-    let mut cmd = Command::new(&single.program);
+    let mut cmd = Command::from(single.program_command());
     apply_single_to_tokio_command(&single, &mut cmd);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -770,7 +770,7 @@ async fn spawn_pipeline_async(
     let mut stderr_tasks: Vec<tokio::task::JoinHandle<Vec<u8>>> = Vec::new();
 
     for (i, stage) in stages.iter().enumerate() {
-        let mut cmd = Command::new(&stage.program);
+        let mut cmd = Command::from(stage.program_command());
         apply_single_to_tokio_command(stage, &mut cmd);
 
         if i == 0 {

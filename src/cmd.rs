@@ -58,6 +58,7 @@ use crate::stdin::StdinData;
 
 #[cfg(feature = "tokio")]
 mod async_cmd;
+mod program;
 
 /// Internal type alias for the `before_spawn` callback. Not part of the
 /// public API — callers pass closures directly to [`Cmd::before_spawn`].
@@ -106,22 +107,6 @@ impl SingleCmd {
             env_clear: false,
             env_remove: Vec::new(),
             envs: Vec::new(),
-        }
-    }
-
-    fn apply_to(&self, cmd: &mut Command) {
-        cmd.args(&self.args);
-        if let Some(d) = &self.cwd {
-            cmd.current_dir(d);
-        }
-        if self.env_clear {
-            cmd.env_clear();
-        }
-        for k in &self.env_remove {
-            cmd.env_remove(k);
-        }
-        for (k, v) in &self.envs {
-            cmd.env(k, v);
         }
     }
 }
@@ -1212,7 +1197,7 @@ fn execute_single(
     timeout: Option<Duration>,
     cancel: Option<&CancelControl>,
 ) -> Result<RunOutput, RunError> {
-    let mut cmd = Command::new(&single.program);
+    let mut cmd = single.program_command();
     single.apply_to(&mut cmd);
 
     match &stdin {
@@ -1499,7 +1484,7 @@ fn execute_pipeline(
     let mut stdin_for_feed = Some(stdin);
 
     for (i, stage) in stages.iter().enumerate() {
-        let mut cmd = Command::new(&stage.program);
+        let mut cmd = stage.program_command();
         stage.apply_to(&mut cmd);
 
         if i == 0 {
@@ -1690,7 +1675,7 @@ fn spawn_single_stage(
     stdin_attempt: SyncStdinForAttempt,
     display: CmdDisplay,
 ) -> Result<SpawnedProcess, RunError> {
-    let mut cmd = Command::new(&single.program);
+    let mut cmd = single.program_command();
     single.apply_to(&mut cmd);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -1731,7 +1716,7 @@ fn spawn_pipeline_stages(
     let mut stderr_threads: Vec<thread::JoinHandle<Vec<u8>>> = Vec::new();
 
     for (i, stage) in stages.iter().enumerate() {
-        let mut cmd = Command::new(&stage.program);
+        let mut cmd = stage.program_command();
         stage.apply_to(&mut cmd);
 
         if i == 0 {
