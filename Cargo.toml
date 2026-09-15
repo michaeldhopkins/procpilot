@@ -127,6 +127,11 @@ wait-timeout = "0.2"
 
 [dev-dependencies]
 anyhow = "1"
+# syn + proc-macro2: tests/file_length.rs parses the crate's own source to leave inline tests out
+# of each file's count; a text scan is fooled by strings and comments. `span-locations` gives it
+# exact line spans.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync", "io-util"] }
 

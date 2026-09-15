@@ -13,6 +13,7 @@ Before every commit, verify:
 6. [ ] Version bumped in `Cargo.toml` (patch for fixes/docs, minor for features, `0.x` breaking bumps minor)
 7. [ ] `cargo check` run after version bump (updates `Cargo.lock`)
 8. [ ] If the release will generate user-visible changes, `git cliff --output CHANGELOG.md`
+9. [ ] No file under `src/` over 400 production lines (`tests/file_length.rs`; inline test modules are not counted). Files already over when the gate went in (2026-09-14) are pinned at that size and may only shrink. New code goes in a new module, never into a pinned file.
 
 Never use `#[allow(...)]` to suppress warnings — fix the underlying issue.
 
