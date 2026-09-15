@@ -1,1 +1,4 @@
 /target
+
+# Playwright MCP session artifacts: page snapshots, console logs, screenshots.
+.playwright-mcp/
