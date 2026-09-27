@@ -1,0 +1,16 @@
+# cargo-mutants settings, so a bare `cargo mutants` works from a clone. Method: the
+# `rust-mutation-testing` skill; procpilot's numbers are in AGENTS.md "Mutation testing".
+
+# The integration tests (tests/runner.rs, spawned.rs, pipeline.rs, program_resolution.rs,
+# async_runner.rs, mock_runner.rs) need `mock-binaries`, `tokio` and `testing`. Without them the
+# suite is the unit tests alone and every mutant only an integration test catches reads MISSED.
+all_features = true
+
+exclude_globs = [
+    # The pp_* mock children the integration tests spawn. They are test fixtures behind
+    # `mock-binaries`, never shipped; mutating one tests the tests' fixtures, not procpilot.
+    "src/bin/**",
+    # Compiled only under `--cfg fuzzing` (cargo fuzz), so `cargo test` never builds it and
+    # every mutant here would survive by construction.
+    "src/fuzz_api.rs",
+]
