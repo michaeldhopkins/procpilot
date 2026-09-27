@@ -1,12 +1,13 @@
 name: Mutants
 
-# Mutation testing of the code a change actually touches.
+# Mutation testing, in two short jobs, neither a gate.
 #
 # `cargo mutants` generates plausible bugs and reports the ones the tests fail to
-# notice. `--in-diff` restricts it to mutants overlapping the changed regions, which
-# is minutes and puts a finding in the review conversation where it is cheapest to
-# act on. Not a gate: no branch rule requires it. The whole tree was swept once at
-# adoption (AGENTS.md, "Mutation testing"); there is no scheduled sweep.
+# notice. `in-diff` (pushes to main and PRs) restricts it to mutants overlapping the
+# changed regions, which is minutes and puts a finding in the review conversation
+# where it is cheapest to act on. `slice` (pushes to main only) runs one rotating
+# quarter of the whole tree, so unchanged code is looked at too. No whole-tree run and
+# no schedule (AGENTS.md, "Mutation testing").
 #
 # `.cargo/mutants.toml` turns on all features, which the integration tests need.
 # General method is in the `rust-mutation-testing` skill; procpilot's specifics are
@@ -28,7 +29,7 @@ jobs:
   in-diff:
     name: Mutants in changed code
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -43,6 +44,7 @@ jobs:
       # Prebuilt binary; `cargo install` would rebuild it on every run.
       - uses: taiki-e/install-action@v2
         with:
+          tool: cargo-mutants
 
       # procpilot lands work by pushing to main as well as by PR, so both need a diff.
       # A PR diffs against its base; a push diffs against the commit it replaced.
@@ -130,7 +132,7 @@ jobs:
           #
           # Exit 0 because a broad diff is not a test failure, but emit a WARNING
           # rather than a notice: this is coverage the gate did not provide, and
-          # per AGENTS.md a bounded run must say what it dropped.
+          # a bounded run must say what it dropped.
           MAX_SELECTED=100
           if [ "$selected" -gt "$MAX_SELECTED" ]; then
             echo "skipped" > mutants-status.txt
@@ -159,7 +161,8 @@ jobs:
           # both Summarise and Archive still ran and succeeded, so a timed-out run
           # does report its partial results. The reason to avoid hitting the
           # timeout is the wasted 45 minutes, not a lost report.
-          cargo mutants --no-shuffle -vV --in-diff mutants.diff
+          # -j2 and stdin closed: see the slice job.
+          cargo mutants --no-shuffle -vV -j2 --in-diff mutants.diff < /dev/null
 
       # Put the finding in the run summary so a reviewer sees it without
       # downloading an artifact. `missed.txt` is the actual deliverable.
@@ -246,5 +249,78 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mutants-in-diff
+          path: mutants.out
+          if-no-files-found: ignore
+
+  # Old code nobody touches is never selected by --in-diff, so each push to main
+  # also runs one rotating slice of the whole tree: shard k of N, k advancing
+  # with the run number. Every N pushes the tree has been looked at once, and no
+  # job ever runs long. The tree changes between slices, so the coverage is
+  # approximate, which is fine. N and how it was chosen are in AGENTS.md.
+  slice:
+    name: Mutants, rotating slice
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SLICES: 4
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      # -j2 is what the slice was measured at (AGENTS.md). Stdin is closed because one
+      # async test runs a child that inherits it and reads to EOF (AGENTS.md).
+      - name: Mutants
+        run: |
+          set -euo pipefail
+          k=$(( ${{ github.run_number }} % SLICES ))
+          echo "$k" > mutants-slice.txt
+          echo "Slice $k of $SLICES"
+          cargo mutants --no-shuffle -vV -j2 --shard "$k/$SLICES" < /dev/null
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -euo pipefail
+          k="$(cat mutants-slice.txt 2>/dev/null || echo '?')"
+          {
+            echo "## Mutants, slice $k of $SLICES"
+            echo
+            if [ ! -d mutants.out ]; then
+              echo 'No results directory: the run failed before reporting.'
+              echo '**Treat this as no coverage, not as a pass.**'
+              exit 0
+            fi
+            for kind in missed caught unviable timeout; do
+              f="mutants.out/$kind.txt"
+              n=0
+              [ -f "$f" ] && n=$(wc -l < "$f" | tr -d ' ')
+              echo "- **$kind**: $n"
+            done
+            if [ -s mutants.out/missed.txt ]; then
+              echo
+              echo '### Missed in this slice'
+              echo
+              echo '```'
+              cat mutants.out/missed.txt
+              echo '```'
+              echo
+              echo 'Old code, not this push: give each a test or an exclusion'
+              echo 'with its reason, as for any other miss.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive mutants.out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-slice
           path: mutants.out
           if-no-files-found: ignore
