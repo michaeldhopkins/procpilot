@@ -22,6 +22,8 @@ exclude_re = [
     # `now < deadline` against `now <= deadline` differs only when two Instant reads
     # are equal, and then the extra pass polls the flag and sleeps for zero.
     "replace < with <= in cancellable_sleep",
+    # Equivalent for the same reason: the grace-period loop's `now < deadline`.
+    "replace < with <= in kill_with_grace",
     # `t - elapsed` bounds the last poll so the timeout fires on time; `t + elapsed` overshoots it
     # by at most one CANCEL_POLL_INTERVAL (50ms). Only an upper bound on wall-clock time could
     # see that, and a 50ms bound flakes on a loaded runner. The timeout itself is tested
