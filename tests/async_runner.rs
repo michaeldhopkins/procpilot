@@ -578,3 +578,58 @@ async fn run_async_nonzero_exit_carries_attempt_count_on_retry_exhaustion() {
     assert!(err.is_non_zero_exit());
     assert_eq!(err.attempts(), 4);
 }
+
+#[tokio::test]
+async fn spawn_async_single_command_is_not_a_pipeline() {
+    let mut proc = Cmd::new(PP_ECHO).arg("x").spawn_async().await.expect("spawn");
+    assert!(!proc.is_pipeline());
+    assert_eq!(proc.pids().len(), 1);
+    let _ = proc.wait().await;
+}
+
+#[tokio::test]
+async fn spawn_async_wait_timeout_returns_output_when_done() {
+    let mut proc = Cmd::new(PP_ECHO).arg("quick").spawn_async().await.expect("spawn");
+    let out = proc
+        .wait_timeout(Duration::from_secs(30))
+        .await
+        .expect("wait_timeout")
+        .expect("pp_echo exits long before 30s");
+    assert_eq!(out.stdout_lossy().trim(), "quick");
+}
+
+#[tokio::test]
+async fn spawn_async_try_wait_reports_running_then_done() {
+    let mut proc = Cmd::new(PP_SLEEP).arg("300").spawn_async().await.expect("spawn");
+    assert!(proc.try_wait().await.expect("try_wait").is_none());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if proc.try_wait().await.expect("try_wait").is_some() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "try_wait never reported completion");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn spawn_async_wait_carries_stderr() {
+    let mut proc = Cmd::new(PP_STATUS)
+        .args(["0", "--err", "to-stderr"])
+        .spawn_async()
+        .await
+        .expect("spawn");
+    let out = proc.wait().await.expect("wait");
+    assert_eq!(out.stderr, "to-stderr\n");
+}
+
+#[tokio::test]
+async fn spawn_async_debug_names_the_command_and_pids() {
+    let mut proc = Cmd::new(PP_ECHO).arg("debug-me").spawn_async().await.expect("spawn");
+    let pid = proc.pids()[0];
+    let dbg = format!("{proc:?}");
+    assert!(dbg.starts_with("AsyncSpawnedProcess"), "{dbg}");
+    assert!(dbg.contains("debug-me"), "{dbg}");
+    assert!(dbg.contains(&pid.to_string()), "{dbg}");
+    let _ = proc.wait().await;
+}
