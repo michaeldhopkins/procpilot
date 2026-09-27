@@ -280,3 +280,32 @@ fn cancel_pre_set_skips_pipeline_spawn() {
         "pre-flight should not spawn pipeline, took {elapsed:?}"
     );
 }
+
+#[test]
+fn spawned_pipeline_feeds_stdin_to_the_first_stage() {
+    let proc = Cmd::new(PP_CAT)
+        .stdin("fed to stage one\n")
+        .pipe(Cmd::new(PP_CAT))
+        .spawn()
+        .expect("spawn");
+    // Bounded: if the feed went anywhere but stage one, its cat would wait for input forever.
+    let out = proc
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait_timeout")
+        .expect("stage one never got its stdin");
+    assert_eq!(out.stdout_lossy(), "fed to stage one\n");
+}
+
+#[test]
+fn pipeline_with_a_timeout_returns_the_last_stage_output() {
+    // The timeout bounds a miswired pipeline (a stage left waiting on a pipe nobody closes), so it
+    // fails here instead of hanging the suite.
+    let out = Cmd::new(PP_ECHO)
+        .arg("through")
+        .pipe(Cmd::new(PP_CAT))
+        .pipe(Cmd::new(PP_CAT))
+        .timeout(Duration::from_secs(5))
+        .run()
+        .expect("ok");
+    assert_eq!(out.stdout_lossy().trim(), "through");
+}

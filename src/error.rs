@@ -387,6 +387,17 @@ mod tests {
         assert!(non_zero_exit("").is_non_zero_exit());
         assert!(timeout_error().is_timeout());
         assert!(cancelled_error().is_cancelled());
+        assert!(!non_zero_exit("").is_spawn_failure());
+        assert!(!spawn_error().is_non_zero_exit());
+        assert!(!spawn_error().is_timeout());
+        assert!(!spawn_error().is_cancelled());
+    }
+
+    #[test]
+    fn stream_suffix_size_is_128_kib() {
+        // Written flat rather than as `128 * 1024`, so an edit to the constant's expression cannot
+        // change this expectation with it.
+        assert_eq!(STREAM_SUFFIX_SIZE, 131_072);
     }
 
     #[test]

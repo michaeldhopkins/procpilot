@@ -191,6 +191,7 @@ mod tests {
         let d = cd("git", &["status"], false);
         assert_eq!(d.to_string(), "git status");
         assert!(!d.is_pipeline());
+        assert!(!d.is_secret());
     }
 
     #[test]
