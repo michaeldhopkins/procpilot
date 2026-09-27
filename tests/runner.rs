@@ -329,7 +329,9 @@ fn cancel_pre_set_skips_spawn_and_returns_immediately() {
     let flag = Arc::new(AtomicBool::new(true)); // already cancelled
     let start = Instant::now();
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000") // would sleep a full minute if it ran
+        // 8s, not longer: a broken cancel check then fails this test when the sleep ends,
+        // well inside cargo-mutants' per-mutant timeout, instead of hanging until it.
+        .arg("8000")
         .cancel(flag)
         .run()
         .expect_err("fail");
@@ -338,7 +340,7 @@ fn cancel_pre_set_skips_spawn_and_returns_immediately() {
     assert_eq!(err.stdout(), Some(&[][..]));
     assert_eq!(err.stderr(), Some(""));
     assert_eq!(err.attempts(), 1);
-    // Pre-flight returns immediately — far below the 60s sleep, even
+    // Pre-flight returns immediately — far below the 8s sleep, even
     // accounting for slow CI machines.
     assert!(
         elapsed < Duration::from_secs(1),
@@ -363,13 +365,13 @@ fn cancel_mid_run_kills_child_and_returns_cancelled() {
 
     let start = Instant::now();
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000")
+        .arg("8000") // see cancel_pre_set_skips_spawn_and_returns_immediately
         .cancel(flag)
         .run()
         .expect_err("fail");
     let elapsed = start.elapsed();
     assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
-    // We should bail out well before the 60s sleep — 5s budget is very
+    // We should bail out well before the 8s sleep — 5s budget is very
     // generous and covers the 50ms poll cadence + 500ms grace period.
     assert!(
         elapsed < Duration::from_secs(5),
@@ -464,4 +466,76 @@ fn cancel_grace_is_clonable_with_cmd() {
         .cancel(flag)
         .cancel_grace(Duration::from_millis(200));
     let _ = base.clone().run().expect("ok");
+}
+
+#[test]
+fn a_deadline_still_ahead_lets_a_retrying_command_run() {
+    // Only the retry loop checks the deadline before an attempt.
+    let out = Cmd::new(PP_ECHO)
+        .arg("in time")
+        .retry(RetryPolicy::default())
+        .deadline(Instant::now() + Duration::from_secs(30))
+        .run()
+        .expect("a deadline 30s away must not stop a quick command");
+    assert_eq!(out.stdout_lossy().trim(), "in time");
+}
+
+#[test]
+fn cancel_with_a_timeout_lets_a_quick_command_finish() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // With both set, the wait goes through the cancel-polling loop, which checks the timeout itself.
+    let out = Cmd::new(PP_ECHO)
+        .arg("hello")
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .timeout(Duration::from_secs(30))
+        .run()
+        .expect("ok");
+    assert_eq!(out.stdout_lossy().trim(), "hello");
+}
+
+#[test]
+fn cancel_with_a_timeout_still_times_out() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("8000")
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .timeout(Duration::from_millis(200))
+        .run()
+        .expect_err("fail");
+    assert!(err.is_timeout(), "expected Timeout, got {err:?}");
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn cancel_waits_out_the_grace_period_before_sigkill() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    // The child ignores SIGTERM, so only the SIGKILL sent after the grace period stops it. A lower
+    // bound on elapsed time is what shows the grace was honoured; it cannot flake on a slow machine.
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+    let grace = Duration::from_millis(600);
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .args(["8000", "--ignore-sigterm"])
+        .cancel(flag)
+        .cancel_grace(grace)
+        .run()
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert!(elapsed >= grace, "SIGKILL came before the {grace:?} grace ran out: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "SIGKILL never came: {elapsed:?}");
 }
