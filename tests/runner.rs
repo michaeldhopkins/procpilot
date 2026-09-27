@@ -539,3 +539,23 @@ fn cancel_waits_out_the_grace_period_before_sigkill() {
     assert!(elapsed >= grace, "SIGKILL came before the {grace:?} grace ran out: {elapsed:?}");
     assert!(elapsed < Duration::from_secs(5), "SIGKILL never came: {elapsed:?}");
 }
+
+#[test]
+fn an_unset_cancel_flag_still_sleeps_through_retry_backoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // With a cancel flag the backoff sleeps in polled steps; it must still sleep the full delay.
+    // The default policy waits 100 + 200 + 400ms before its three retries (jitter only adds), so
+    // a lower bound cannot flake on a slow machine.
+    let start = Instant::now();
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry(RetryPolicy::default())
+        .retry_when(|_| true)
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .run()
+        .expect_err("fail");
+    assert_eq!(err.attempts(), 4);
+    assert!(start.elapsed() >= Duration::from_millis(700), "backoff was skipped: {:?}", start.elapsed());
+}
