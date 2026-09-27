@@ -14,3 +14,17 @@ exclude_globs = [
     # every mutant here would survive by construction.
     "src/fuzz_api.rs",
 ]
+
+# Each entry names one mutant and says why no test should chase it. Anything else MISSED needs a
+# test.
+exclude_re = [
+    # Equivalent, here and in its twin cancellable_sleep_async, which the pattern also matches.
+    # `now < deadline` against `now <= deadline` differs only when two Instant reads
+    # are equal, and then the extra pass polls the flag and sleeps for zero.
+    "replace < with <= in cancellable_sleep",
+    # `t - elapsed` bounds the last poll so the timeout fires on time; `t + elapsed` overshoots it
+    # by at most one CANCEL_POLL_INTERVAL (50ms). Only an upper bound on wall-clock time could
+    # see that, and a 50ms bound flakes on a loaded runner. The timeout itself is tested
+    # (tests/runner.rs, cancel_with_a_timeout_still_times_out).
+    "replace - with \\+ in wait_single_with_cancel",
+]
