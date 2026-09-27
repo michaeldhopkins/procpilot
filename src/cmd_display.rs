@@ -276,6 +276,17 @@ mod tests {
     }
 
     #[test]
+    fn each_stage_exposes_its_own_program_and_args() {
+        let mut d = cd("git", &["log", "-5"], true);
+        d.push_stage("grep".into(), vec!["foo".into()]);
+        let stages = d.stages();
+        assert_eq!(stages[0].program(), &OsString::from("git"));
+        assert_eq!(stages[0].raw_args(), [OsString::from("log"), OsString::from("-5")]);
+        assert_eq!(stages[1].program(), &OsString::from("grep"));
+        assert_eq!(stages[1].raw_args(), [OsString::from("foo")], "secret redacts Display, not the raw args");
+    }
+
+    #[test]
     fn pipeline_with_secret_redacts_every_stage() {
         let mut d = cd("docker", &["login", "-p", "hunter2"], true);
         d.push_stage("jq".into(), vec![".token".into()]);
