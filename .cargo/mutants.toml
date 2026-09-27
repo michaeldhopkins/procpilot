@@ -27,4 +27,9 @@ exclude_re = [
     # see that, and a 50ms bound flakes on a loaded runner. The timeout itself is tested
     # (tests/runner.rs, cancel_with_a_timeout_still_times_out).
     "replace - with \\+ in wait_single_with_cancel",
+    # Equivalent, here and in execute_pipeline_async. When stage i is cancelled, `j != i` kills
+    # every other stage; `j == i` kills only stage i, which is already reaped. Nothing changes:
+    # the stages before i have already been waited on, and the loop's next passes kill the ones
+    # after it because the last outcome is Cancelled.
+    "replace != with == in execute_pipeline",
 ]
