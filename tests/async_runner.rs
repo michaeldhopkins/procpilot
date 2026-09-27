@@ -496,7 +496,9 @@ async fn run_async_cancel_pre_set_returns_immediately() {
     let flag = Arc::new(AtomicBool::new(true));
     let start = Instant::now();
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000")
+        // 8s, not longer: a broken cancel check then fails when the sleep ends, inside
+        // cargo-mutants' per-mutant timeout, instead of hanging until it.
+        .arg("8000")
         .cancel(flag)
         .run_async()
         .await
@@ -524,7 +526,7 @@ async fn run_async_cancel_mid_run_kills_child() {
 
     let start = Instant::now();
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000")
+        .arg("8000") // see run_async_cancel_pre_set_returns_immediately
         .cancel(flag)
         .run_async()
         .await
@@ -632,4 +634,28 @@ async fn spawn_async_debug_names_the_command_and_pids() {
     assert!(dbg.contains("debug-me"), "{dbg}");
     assert!(dbg.contains(&pid.to_string()), "{dbg}");
     let _ = proc.wait().await;
+}
+
+#[tokio::test]
+async fn spawn_async_pipeline_reports_the_rightmost_failure() {
+    let mut proc = Cmd::new(PP_STATUS)
+        .arg("2")
+        .pipe(Cmd::new(PP_STATUS).arg("5"))
+        .spawn_async()
+        .await
+        .expect("spawn");
+    let err = proc.wait().await.expect_err("both stages fail");
+    assert_eq!(err.exit_status().and_then(|s| s.code()), Some(5));
+}
+
+#[tokio::test]
+async fn spawn_async_pipeline_fails_when_only_an_early_stage_fails() {
+    let mut proc = Cmd::new(PP_STATUS)
+        .arg("3")
+        .pipe(Cmd::new(PP_CAT))
+        .spawn_async()
+        .await
+        .expect("spawn");
+    let err = proc.wait().await.expect_err("pipefail: the first stage's failure wins over cat's success");
+    assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
 }
