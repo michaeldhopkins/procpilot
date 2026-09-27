@@ -95,7 +95,7 @@ impl fmt::Display for CmdDisplay {
             if i > 0 {
                 f.write_str(" | ")?;
             }
-            write!(f, "{}", shell_quote_os(&stage.program))?;
+            write!(f, "{}", shell_quote_program(&stage.program))?;
             if self.secret {
                 write!(f, " <secret>")?;
             } else {
@@ -114,20 +114,56 @@ impl fmt::Display for CmdDisplay {
 /// unchanged. Falls back to lossy display for non-UTF-8 values.
 fn shell_quote_os(s: &std::ffi::OsStr) -> String {
     let lossy = s.to_string_lossy();
-    let needs_quote = lossy.is_empty()
-        || lossy.chars().any(|c| {
+    if needs_quote(&lossy) {
+        single_quote(&lossy)
+    } else {
+        lossy.into_owned()
+    }
+}
+
+/// [`shell_quote_os`] for the word in command position, where a shell also
+/// reads a bare `NAME=value` as an assignment and a bare `if` as syntax. A
+/// program by either name is quoted, so the rendered line still runs it.
+fn shell_quote_program(s: &std::ffi::OsStr) -> String {
+    let lossy = s.to_string_lossy();
+    if needs_quote(&lossy) || is_assignment(&lossy) || RESERVED_WORDS.contains(&lossy.as_ref()) {
+        single_quote(&lossy)
+    } else {
+        lossy.into_owned()
+    }
+}
+
+/// Words POSIX sh and bash read as syntax in command position. The rest
+/// (`!`, `{`, `[[`, ...) hold characters [`needs_quote`] already quotes.
+const RESERVED_WORDS: &[&str] = &[
+    "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in",
+    "select", "then", "time", "until", "while",
+];
+
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn needs_quote(word: &str) -> bool {
+    word.is_empty()
+        || word.chars().any(|c| {
             !(c.is_ascii_alphanumeric()
                 || matches!(
                     c,
                     '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
                 ))
-        });
-    if !needs_quote {
-        return lossy.into_owned();
-    }
-    let mut out = String::with_capacity(lossy.len() + 2);
+        })
+}
+
+fn single_quote(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
     out.push('\'');
-    for ch in lossy.chars() {
+    for ch in word.chars() {
         if ch == '\'' {
             out.push_str("'\\''");
         } else {
@@ -248,6 +284,25 @@ mod tests {
         assert!(!rendered.contains(".token"));
         assert!(rendered.contains("docker <secret>"));
         assert!(rendered.contains("jq <secret>"));
+    }
+
+    #[test]
+    fn program_that_reads_as_an_assignment_is_quoted() {
+        assert_eq!(cd("f=", &["x"], false).to_string(), "'f=' x");
+        assert_eq!(cd("A_1=b", &[], true).to_string(), "'A_1=b' <secret>");
+        assert_eq!(cd("x", &["f=1"], false).to_string(), "x f=1", "an argument is not in command position");
+        assert_eq!(cd("=f", &[], false).to_string(), "=f", "no name before the =");
+        assert_eq!(cd("1a=b", &[], false).to_string(), "1a=b", "a name cannot start with a digit");
+    }
+
+    #[test]
+    fn program_that_is_a_reserved_word_is_quoted() {
+        assert_eq!(cd("if", &["x"], false).to_string(), "'if' x");
+        let mut d = cd("git", &["log"], false);
+        d.push_stage("done".into(), vec![]);
+        assert_eq!(d.to_string(), "git log | 'done'", "every stage's program is in command position");
+        assert_eq!(cd("x", &["if"], false).to_string(), "x if", "an argument is not in command position");
+        assert_eq!(cd("iff", &[], false).to_string(), "iff");
     }
 
 }
