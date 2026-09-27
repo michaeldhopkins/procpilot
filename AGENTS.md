@@ -67,6 +67,8 @@ CI runs on push/PR:
 - `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` (catches broken doc links)
 - `cargo deny check licenses`
 
+Fuzzing has its own workflows; see "Fuzzing" below.
+
 Release workflow publishes to crates.io on version-bump push to main.
 
 ## Architecture notes
@@ -81,3 +83,29 @@ Once Phase 1 (0.2.0) lands, the module shape becomes:
 - `src/error.rs` — `RunError`, `CmdDisplay`
 - `src/stdin.rs`, `src/redirection.rs`, `src/retry.rs` — supporting types
 - `src/spawned.rs` (Phase 2) — `SpawnedProcess`
+
+## Fuzzing
+
+cargo-fuzz targets live in `fuzz/` (a standalone workspace, nightly only). The method is the `rust-fuzzing` skill; this section is what is true only of procpilot. The crate builds no shipped binary (the `pp_*` bins are test mocks behind `mock-binaries`), so what is fuzzed is the library's own surface that takes input nobody here wrote.
+
+| Target | Input | Asserts |
+|---|---|---|
+| `cmd_display` | programs and arguments a caller hands `Cmd` (arbitrary bytes, via `arbitrary`), pipelines, `.secret()` | `CmdDisplay` split back by `shlex` (an independent POSIX splitter) gives the same argv, with `\|` between stages; secret renders split to exactly `program <secret>` per stage; outside single quotes the render holds no character a shell expands (`$`, `*`, `~`, ...), which `shlex` cannot see since it does no expansion; a program left unquoted is never an assignment (`f=`) or a reserved word (`if`) |
+| `captured_output` | a child's stdout/stderr bytes (invalid UTF-8, split characters) | through `src/fuzz_api.rs`: stdout keeps exactly the last `STREAM_SUFFIX_SIZE` bytes; stderr, lossily decoded, is a tail of the decoded text within 3 bytes under the cap |
+
+- `src/fuzz_api.rs` exists only under `--cfg fuzzing` and reaches crate-private functions without publishing them.
+- `captured_output` pads the fuzzed bytes with 128 KiB of ASCII so the cut lands inside them; its first version put the padding in front, so the cut always fell in the padding and a planted bug in the character-boundary walk stayed green.
+- Words that are not UTF-8 are rendered lossily by design, so `cmd_display` checks only that they do not panic.
+- Seeds (`fuzz/corpus/<t>/seed-*`) are the inputs that turned each planted mutation red, so the replay alone catches those regressions. `seed-found-program-assignment` is the input that found the unquoted `f=` program.
+- `fuzz/dict/cmd_display.dict` is shell metacharacters, the reserved-word probe and a split UTF-8 character.
+- Not fuzzed yet: the PATH search's `#!` line parser (`format_of` / `interpreter` in `src/cmd/program.rs`) reads the head of whatever file sits on `PATH`, which is a real surface. It was left alone while that module was being rewritten; it is the next target to add, as a never-panics target over the head bytes (a `Runnable` answer also needs the named interpreter to exist, so keep the file checks out of it).
+- Not fuzzed, and why: retry schedules are backon's, and procpilot only passes the builder through; spawning, piping and timeouts are covered by the integration tests with the `pp_*` mocks, where the bytes do not change the code path.
+
+CI: `fuzz-replay.yml` replays the corpus on every push to `main` and every PR (the gate); `fuzz.yml` bursts each target for ~180s on each push to `main` through `fuzz/burst.sh` and saves the merged corpus to the Actions cache (not a gate; `workflow_dispatch` takes a longer budget). No schedule. `tests/fuzz_targets_wired.rs` fails when `fuzz/Cargo.toml` and the workflows disagree.
+
+Locally, one target at a time:
+
+```sh
+cargo +nightly fuzz build cmd_display
+fuzz/burst.sh fuzz/target/aarch64-apple-darwin/release/cmd_display cmd_display 60
+```
