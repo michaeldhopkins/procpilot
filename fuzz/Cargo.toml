@@ -1,0 +1,42 @@
+# Standalone workspace (see the empty `[workspace]` below): the root `cargo build` / `test` /
+# `clippy` / `deny` never see it, so the main crate stays on stable while this builds only under
+# `cargo fuzz`, which needs nightly for `-Zsanitizer`.
+
+[package]
+name = "procpilot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# The oracle cmd_display parses the rendered command back with: an independent POSIX word
+# splitter, not procpilot's own quoting rule run in reverse.
+shlex = "1.3"
+
+[dependencies.procpilot]
+path = ".."
+
+[workspace]
+
+# Line-level debug info so a crash stack trace names the procpilot function.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "cmd_display"
+path = "fuzz_targets/cmd_display.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "captured_output"
+path = "fuzz_targets/captured_output.rs"
+test = false
+doc = false
+bench = false

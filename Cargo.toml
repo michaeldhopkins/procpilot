@@ -14,6 +14,9 @@ categories = ["os", "development-tools"]
 exclude = [
     "scripts/",
     ".github/",
+    "fuzz/",
+    # Reads fuzz/ and .github/, which are not in the package.
+    "tests/fuzz_targets_wired.rs",
     "AGENTS.md",
     "CLAUDE.md",
     "cliff.toml",
@@ -151,6 +154,10 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync", "io-util"] }
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`, which gates `src/fuzz_api.rs`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
 struct-excessive-bools = "deny"

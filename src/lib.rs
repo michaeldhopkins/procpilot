@@ -72,6 +72,9 @@ mod async_spawned;
 mod cmd;
 mod cmd_display;
 mod error;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz_api;
 mod redirection;
 mod retry;
 mod runner;
