@@ -659,3 +659,13 @@ async fn spawn_async_pipeline_fails_when_only_an_early_stage_fails() {
     let err = proc.wait().await.expect_err("pipefail: the first stage's failure wins over cat's success");
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
 }
+
+#[tokio::test]
+async fn spawn_async_kill_stops_the_child() {
+    let mut proc = Cmd::new(PP_SLEEP).arg("8000").spawn_async().await.expect("spawn");
+    let start = Instant::now();
+    proc.kill().await.expect("kill");
+    let err = proc.wait().await.expect_err("a killed child does not exit 0");
+    assert!(err.is_non_zero_exit(), "expected NonZeroExit, got {err:?}");
+    assert!(start.elapsed() < Duration::from_secs(5), "kill did not stop the 8s sleep");
+}

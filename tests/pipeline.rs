@@ -100,9 +100,11 @@ fn pipeline_timeout_kills_hung_stage() {
 
 #[test]
 fn pipeline_does_not_deadlock_on_large_output() {
+    // The timeout turns a deadlock into a failure here rather than a hung suite.
     let out = Cmd::new(PP_SPAM)
         .arg("100000")
         .pipe(Cmd::new(PP_CAT))
+        .timeout(Duration::from_secs(10))
         .run()
         .expect("ok");
     assert!(out.stdout.len() >= 100_000);
@@ -244,10 +246,11 @@ fn cancel_kills_all_pipeline_stages() {
     });
 
     let start = Instant::now();
-    // Both stages sleep for a minute — without cancellation this would hang.
+    // Both stages sleep 8s: long enough that only cancellation explains a prompt return, short
+    // enough that a broken cancel fails this test inside cargo-mutants' per-mutant timeout.
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000")
-        .pipe(Cmd::new(PP_SLEEP).arg("60000"))
+        .arg("8000")
+        .pipe(Cmd::new(PP_SLEEP).arg("8000"))
         .cancel(flag)
         .run()
         .expect_err("fail");
@@ -268,8 +271,8 @@ fn cancel_pre_set_skips_pipeline_spawn() {
     let flag = Arc::new(AtomicBool::new(true)); // pre-set
     let start = Instant::now();
     let err = Cmd::new(PP_SLEEP)
-        .arg("60000")
-        .pipe(Cmd::new(PP_SLEEP).arg("60000"))
+        .arg("8000")
+        .pipe(Cmd::new(PP_SLEEP).arg("8000"))
         .cancel(flag)
         .run()
         .expect_err("fail");
