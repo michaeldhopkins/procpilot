@@ -67,7 +67,7 @@ CI runs on push/PR:
 - `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` (catches broken doc links)
 - `cargo deny check licenses`
 
-Fuzzing has its own workflows; see "Fuzzing" below.
+Fuzzing has its own workflows; see "Fuzzing" below. So does mutation testing; see "Mutation testing".
 
 Release workflow publishes to crates.io on version-bump push to main.
 
@@ -109,3 +109,24 @@ Locally, one target at a time:
 cargo +nightly fuzz build cmd_display
 fuzz/burst.sh fuzz/target/aarch64-apple-darwin/release/cmd_display cmd_display 60
 ```
+
+## Mutation testing
+
+cargo-mutants, per the `rust-mutation-testing` skill; this section is only what is true of procpilot. `.cargo/mutants.toml` makes a bare `cargo mutants` work: it turns on all features (the integration tests need `mock-binaries`, `tokio` and `testing`), leaves out the `pp_*` mock binaries (test fixtures, never shipped) and `src/fuzz_api.rs` (compiled only under `cargo fuzz`), and excludes six equivalent or timing-only mutants (four patterns), each with its reason.
+
+**CI** (`.github/workflows/mutants.yml`, not a gate): `--in-diff` on every PR and push to main, and on pushes to main one rotating slice, `--shard (run_number % 4)/4`. Both run `-j2` with stdin closed (see below). No whole-tree run and no schedule.
+
+**Adopted 2026-09-27.** 481 mutants after exclusions (`cargo mutants --list | wc -l`). No whole-tree sweep: slices 0/4 and 1/4 were run and burned down; 2/4 (error, spawned, testing, stdin, retry, runner) and 3/4 (`src/cmd/async_cmd.rs`, `src/cmd/program.rs`) will be covered by CI's rotation.
+
+- **N = 4.** Completed slices at `-j2` on an M3 with other builds running: 0/4 in 2m46s, 1/4 in 3m32s (121 mutants each, baseline 4-5s build + 3-4s test). A hosted runner is slower, so a slice should land near 10 minutes, inside the 20-minute job timeout. An earlier run of slice 0/4 took 15 minutes; contention and the stdin hang below were most of that. Re-measure from the first CI runs and adjust `SLICES` if a slice goes past 15 minutes.
+- **Score**, caught / (caught + missed): the two slices went from 130 / 153 (85%) to 153 / 158 (97%). The 5 still missed are the equivalents below, so every killable mutant in those slices is caught. Before the burn-down: 23 missed and 2 timeouts across the two slices, plus 1 miss in a `src/cmd_display.rs` pilot.
+- **What the misses were:** `AsyncSpawnedProcess` had no test for `is_pipeline` on a single command, `try_wait` or `wait_timeout` returning an output, captured stderr, `Debug`, `kill`, or pipefail. The sync cancel path had no test for the grace period (`pp_sleep --ignore-sigterm` exists for that), for cancel combined with a timeout, or for backoff still sleeping when a cancel flag is set. Also missing: a deadline checked by the retry loop, stdin on a spawned pipeline, the negative forms of the `RunError` predicates and `is_secret`, and `STREAM_SUFFIX_SIZE`'s value.
+- **Two misses that looked caught.** `AsyncSpawnedProcess::kill -> Ok(())` and `pipefail_status` were caught in one run and missed in the next with no code change. Some unrelated test failed by chance under load. Each now has a test that asserts the behaviour itself.
+- **Timeouts became catches.** The cancel tests slept 60s, so a broken cancel check hung the suite until cargo-mutants' ~20s timeout. At 8s, the same mutant fails the test when the sleep ends. `pipeline_does_not_deadlock_on_large_output` now takes a timeout for the same reason. Keep new cancel and deadlock tests under ~10s of worst-case sleep.
+
+**Known equivalents left MISSED, not excluded,** because `exclude_re` matches names, and these share theirs with mutants the tests do catch. A line-anchored pattern would drift with any edit above it.
+
+- `replace - with + / with / in execute_pipeline` and `spawn_pipeline_stages` (and their async twins) at `for _ in 0..stages.len() - 1`: one extra close-on-exec pipe is opened and dropped. Writing the range as `1..stages.len()` removes these mutants. That is a source change, so it belongs in a release.
+- `replace && with || in execute_pipeline` (and its async twin) at `if i == stages.len() - 1 && matches!(stdout_mode, Capture)`: `child.stdout` is `Some` only for a piped (Capture) last stage, so the extra `take()` calls return `None`.
+
+**Stdin must be closed for local runs.** `run_async_async_reader_is_one_shot_across_clones` runs a second clone whose one-shot reader is already taken. That clone then inherits the test process's stdin, and its `pp_cat` reads to EOF. From a terminal or an agent's shell that never comes, and the suite hangs at 0% CPU. Run `cargo mutants ... < /dev/null` (CI does). Whether a consumed reader should give the child an empty stdin rather than the parent's is an open question for the library; the test only encodes the current behaviour.
