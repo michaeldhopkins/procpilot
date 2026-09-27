@@ -14,6 +14,7 @@ categories = ["os", "development-tools"]
 exclude = [
     "scripts/",
     ".github/",
+    "AGENTS.md",
     "CLAUDE.md",
     "cliff.toml",
     "clippy.toml",
