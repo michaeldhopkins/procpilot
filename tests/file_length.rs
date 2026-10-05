@@ -1,7 +1,6 @@
 //! procpilot's file-length gate.
 //!
-//! Copied from cmdproof's (`engine/tests/file_length.rs`), whose `production_lines` rule was
-//! corrected more than once before it measured files honestly; see the comment on it.
+//! Its `production_lines` rule is the subtle part; see the comment on it.
 //! Function-level lints (`clippy.toml`) never see a file growing one function at a time, and
 //! `src/cmd.rs` had reached 2,035 lines by the time this went in (2026-09-14).
 //!
