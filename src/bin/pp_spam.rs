@@ -7,7 +7,11 @@
 
 use std::io::Write;
 
+#[path = "support/orphan.rs"]
+mod orphan;
+
 fn main() {
+    orphan::exit_when_orphaned();
     let count: usize = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())

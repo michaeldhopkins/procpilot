@@ -9,7 +9,11 @@
 
 use std::time::Duration;
 
+#[path = "support/orphan.rs"]
+mod orphan;
+
 fn main() {
+    orphan::exit_when_orphaned();
     let mut args = std::env::args().skip(1);
     let ms: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
     if args.any(|a| a == "--ignore-sigterm") {

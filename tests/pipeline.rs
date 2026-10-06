@@ -5,6 +5,10 @@ use std::time::Duration;
 
 use procpilot::Cmd;
 
+#[path = "support/reaped.rs"]
+mod reaped;
+use reaped::Reaped;
+
 const PP_ECHO: &str = env!("CARGO_BIN_EXE_pp_echo");
 const PP_CAT: &str = env!("CARGO_BIN_EXE_pp_cat");
 const PP_STATUS: &str = env!("CARGO_BIN_EXE_pp_status");
@@ -127,23 +131,23 @@ fn args_after_pipe_target_rightmost() {
 
 #[test]
 fn spawn_on_pipeline_returns_all_pids() {
-    let proc = Cmd::new(PP_ECHO)
+    let proc = Reaped(Cmd::new(PP_ECHO)
         .arg("hi")
         .pipe(Cmd::new(PP_CAT))
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     assert!(proc.is_pipeline());
     assert_eq!(proc.pids().len(), 2);
-    let out = proc.wait().expect("wait");
+    let out = proc.wait_bounded().expect("wait");
     assert_eq!(out.stdout_lossy().trim(), "hi");
 }
 
 #[test]
 fn spawn_pipeline_bidirectional_take_stdin_and_stdout() {
-    let proc = Cmd::new(PP_CAT)
+    let proc = Reaped(Cmd::new(PP_CAT)
         .pipe(Cmd::new(PP_CAT))
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let mut stdin = proc.take_stdin().expect("stdin");
     let mut stdout = proc.take_stdout().expect("stdout");
 
@@ -155,31 +159,31 @@ fn spawn_pipeline_bidirectional_take_stdin_and_stdout() {
     let mut buf = String::new();
     stdout.read_to_string(&mut buf).expect("read");
     writer.join().expect("join");
-    let _ = proc.wait();
+    let _ = proc.wait_bounded();
     assert_eq!(buf, "piped via two cats");
 }
 
 #[test]
 fn spawn_pipeline_kill_sends_to_all_stages() {
-    let proc = Cmd::new(PP_SLEEP)
+    let proc = Reaped(Cmd::new(PP_SLEEP)
         .arg("10000")
         .pipe(Cmd::new(PP_CAT))
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     proc.kill().expect("kill");
     // If kill only reached the first stage, wait would hang on pp_cat waiting
     // for its stdin to close — so this line is the real assertion.
-    let _ = proc.wait();
+    let _ = proc.wait_bounded();
 }
 
 #[test]
 fn spawn_pipeline_pipefail_on_wait() {
-    let proc = Cmd::new(PP_ECHO)
+    let proc = Reaped(Cmd::new(PP_ECHO)
         .arg("x")
         .pipe(Cmd::new(PP_STATUS).arg("3"))
         .spawn()
-        .expect("spawn");
-    let err = proc.wait().expect_err("should fail");
+        .expect("spawn"));
+    let err = proc.wait_bounded().expect_err("should fail");
     assert!(err.is_non_zero_exit());
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
 }
@@ -286,11 +290,11 @@ fn cancel_pre_set_skips_pipeline_spawn() {
 
 #[test]
 fn spawned_pipeline_feeds_stdin_to_the_first_stage() {
-    let proc = Cmd::new(PP_CAT)
+    let proc = Reaped(Cmd::new(PP_CAT)
         .stdin("fed to stage one\n")
         .pipe(Cmd::new(PP_CAT))
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     // Bounded: if the feed went anywhere but stage one, its cat would wait for input forever.
     let out = proc
         .wait_timeout(Duration::from_secs(5))

@@ -11,6 +11,14 @@ const PP_SLEEP: &str = env!("CARGO_BIN_EXE_pp_sleep");
 const PP_STATUS: &str = env!("CARGO_BIN_EXE_pp_status");
 const PP_PRINT_ENV: &str = env!("CARGO_BIN_EXE_pp_print_env");
 
+/// Awaits `f`, failing the test instead of hanging when a child never finishes. The handle a
+/// failing test drops kills its children (tests/leaks.rs, `dropping_an_async_spawned_process_kills_it`).
+async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .expect("child still running at the deadline")
+}
+
 #[tokio::test]
 async fn run_async_before_spawn_hook_fires_once() {
     use std::sync::Arc;
@@ -334,7 +342,7 @@ async fn run_async_pipeline_pipefail() {
 #[tokio::test]
 async fn spawn_async_wait_succeeds() {
     let mut proc = Cmd::new(PP_ECHO).arg("hi").spawn_async().await.expect("spawn");
-    let out = proc.wait().await.expect("wait");
+    let out = bounded(proc.wait()).await.expect("wait");
     assert_eq!(out.stdout_lossy().trim(), "hi");
 }
 
@@ -350,8 +358,8 @@ async fn spawn_async_take_stdin_stdout_bidirectional() {
     });
 
     let mut buf = String::new();
-    stdout.read_to_string(&mut buf).await.expect("read");
-    let out = proc.wait().await.expect("wait ok after stdin closed");
+    bounded(stdout.read_to_string(&mut buf)).await.expect("read");
+    let out = bounded(proc.wait()).await.expect("wait ok after stdin closed");
     assert!(buf.contains("async bidirectional"));
     // RunOutput carries no stdout here because the caller drained via
     // take_stdout — the drain inside finalize is a no-op in that path.
@@ -367,7 +375,7 @@ async fn spawn_async_kill_via_select() {
         _ = proc.wait() => panic!("should not exit on its own"),
         _ = &mut cancel => {
             proc.kill().await.expect("kill");
-            let _ = proc.wait().await;
+            let _ = bounded(proc.wait()).await;
         }
     }
 }
@@ -381,7 +389,7 @@ async fn spawn_async_wait_timeout_returns_none_while_running() {
         .expect("wait_timeout");
     assert!(res.is_none());
     proc.kill().await.expect("kill");
-    let _ = proc.wait().await;
+    let _ = bounded(proc.wait()).await;
 }
 
 #[tokio::test]
@@ -394,15 +402,15 @@ async fn spawn_async_pipeline_pids_count() {
         .expect("spawn");
     assert!(proc.is_pipeline());
     assert_eq!(proc.pids().len(), 2);
-    let out = proc.wait().await.expect("wait");
+    let out = bounded(proc.wait()).await.expect("wait");
     assert_eq!(out.stdout_lossy().trim(), "x");
 }
 
 #[tokio::test]
 async fn async_wait_is_idempotent_on_success() {
     let mut proc = Cmd::new(PP_ECHO).arg("async-idempotent").spawn_async().await.expect("spawn");
-    let first = proc.wait().await.expect("first wait");
-    let second = proc.wait().await.expect("second wait");
+    let first = bounded(proc.wait()).await.expect("first wait");
+    let second = bounded(proc.wait()).await.expect("second wait");
     assert_eq!(first.stdout, second.stdout);
     assert_eq!(first.stdout_lossy().trim(), "async-idempotent");
 }
@@ -414,8 +422,8 @@ async fn async_wait_is_idempotent_on_failure() {
         .spawn_async()
         .await
         .expect("spawn");
-    let first = proc.wait().await.expect_err("first fails");
-    let second = proc.wait().await.expect_err("second fails");
+    let first = bounded(proc.wait()).await.expect_err("first fails");
+    let second = bounded(proc.wait()).await.expect_err("second fails");
     assert_eq!(first.exit_status().unwrap().code(), Some(5));
     assert_eq!(second.exit_status().unwrap().code(), Some(5));
     assert_eq!(first.stderr(), second.stderr());
@@ -429,7 +437,7 @@ async fn async_wait_timeout_none_then_wait_works() {
         .await
         .expect("wait_timeout");
     assert!(first.is_none());
-    let out = proc.wait().await.expect("wait after timeout");
+    let out = bounded(proc.wait()).await.expect("wait after timeout");
     assert!(out.stderr.is_empty());
 }
 
@@ -446,9 +454,9 @@ async fn async_cancel_via_select_then_wait_returns_same() {
     };
     // Cancellation fired; first wait was dropped. Kill and wait again.
     proc.kill().await.expect("kill");
-    let _second = proc.wait().await;
+    let _second = bounded(proc.wait()).await;
     // Third wait must be idempotent with the second.
-    let _third = proc.wait().await;
+    let _third = bounded(proc.wait()).await;
 }
 
 #[tokio::test]
@@ -482,7 +490,7 @@ async fn spawn_async_streaming_lines() {
     while let Ok(Some(line)) = reader.next_line().await {
         lines.push(line);
     }
-    let _ = proc.wait().await;
+    let _ = bounded(proc.wait()).await;
     assert_eq!(lines, vec!["one", "two", "three"]);
 }
 
@@ -586,7 +594,7 @@ async fn spawn_async_single_command_is_not_a_pipeline() {
     let mut proc = Cmd::new(PP_ECHO).arg("x").spawn_async().await.expect("spawn");
     assert!(!proc.is_pipeline());
     assert_eq!(proc.pids().len(), 1);
-    let _ = proc.wait().await;
+    let _ = bounded(proc.wait()).await;
 }
 
 #[tokio::test]
@@ -621,7 +629,7 @@ async fn spawn_async_wait_carries_stderr() {
         .spawn_async()
         .await
         .expect("spawn");
-    let out = proc.wait().await.expect("wait");
+    let out = bounded(proc.wait()).await.expect("wait");
     assert_eq!(out.stderr, "to-stderr\n");
 }
 
@@ -633,7 +641,7 @@ async fn spawn_async_debug_names_the_command_and_pids() {
     assert!(dbg.starts_with("AsyncSpawnedProcess"), "{dbg}");
     assert!(dbg.contains("debug-me"), "{dbg}");
     assert!(dbg.contains(&pid.to_string()), "{dbg}");
-    let _ = proc.wait().await;
+    let _ = bounded(proc.wait()).await;
 }
 
 #[tokio::test]
@@ -644,7 +652,7 @@ async fn spawn_async_pipeline_reports_the_rightmost_failure() {
         .spawn_async()
         .await
         .expect("spawn");
-    let err = proc.wait().await.expect_err("both stages fail");
+    let err = bounded(proc.wait()).await.expect_err("both stages fail");
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(5));
 }
 
@@ -656,7 +664,7 @@ async fn spawn_async_pipeline_fails_when_only_an_early_stage_fails() {
         .spawn_async()
         .await
         .expect("spawn");
-    let err = proc.wait().await.expect_err("pipefail: the first stage's failure wins over cat's success");
+    let err = bounded(proc.wait()).await.expect_err("pipefail: the first stage's failure wins over cat's success");
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
 }
 
@@ -665,7 +673,7 @@ async fn spawn_async_kill_stops_the_child() {
     let mut proc = Cmd::new(PP_SLEEP).arg("8000").spawn_async().await.expect("spawn");
     let start = Instant::now();
     proc.kill().await.expect("kill");
-    let err = proc.wait().await.expect_err("a killed child does not exit 0");
+    let err = bounded(proc.wait()).await.expect_err("a killed child does not exit 0");
     assert!(err.is_non_zero_exit(), "expected NonZeroExit, got {err:?}");
     assert!(start.elapsed() < Duration::from_secs(5), "kill did not stop the 8s sleep");
 }
