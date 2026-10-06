@@ -28,6 +28,8 @@ render_always = true
 postprocessors = []
 
 [git]
+# A commit that changes only TODO.md is internal, whatever its message says.
+exclude_paths = ["TODO.md"]
 # Parse commits according to the conventional commits specification.
 # See https://www.conventionalcommits.org
 conventional_commits = true
@@ -43,6 +45,9 @@ commit_preprocessors = []
 protect_breaking_commits = false
 # An array of regex based parsers for extracting data from the commit message.
 commit_parsers = [
+    # Internal work never reaches the release notes: the TODO file, agent notes and
+    # instructions, whatever the type, and a revert of such a commit.
+    { message = '^(?:[a-z]+(?:\([^)]*\))?!?: Revert ")?[a-z]+\((?:todo|notes|agents)\)!?:', skip = true },
     { message = "^feat", group = "<!-- 0 -->Features" },
     { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
     { message = "^doc", group = "<!-- 3 -->Documentation" },
