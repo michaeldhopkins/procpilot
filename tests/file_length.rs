@@ -26,7 +26,7 @@ const LIMIT: usize = 400;
 /// Files over the limit, each pinned at its production size when the gate went in: it may
 /// shrink, never grow. New code goes in a new module, never into a pinned file.
 fn pinned() -> HashMap<&'static str, usize> {
-    HashMap::from([("src/cmd.rs", 1790), ("src/cmd/async_cmd.rs", 821), ("src/testing.rs", 485)])
+    HashMap::from([("src/cmd.rs", 1788), ("src/cmd/async_cmd.rs", 821), ("src/testing.rs", 485)])
 }
 
 /// Is this item compiled only for tests (`#[test]`, `#[cfg(test)]`)?

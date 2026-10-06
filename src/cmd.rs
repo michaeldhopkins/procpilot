@@ -1469,7 +1469,8 @@ fn execute_pipeline(
     debug_assert!(stages.len() >= 2);
 
     let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
-    for _ in 0..stages.len() - 1 {
+    // One pipe between each adjacent pair of stages.
+    for _ in stages.iter().skip(1) {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),
             source,
@@ -1479,7 +1480,6 @@ fn execute_pipeline(
 
     let mut children: Vec<std::process::Child> = Vec::with_capacity(stages.len());
     let mut stdin_thread: Option<thread::JoinHandle<()>> = None;
-    let mut last_stdout: Option<std::process::ChildStdout> = None;
     let mut stderr_threads: Vec<thread::JoinHandle<Vec<u8>>> = Vec::new();
     let mut stdin_for_feed = Some(stdin);
 
@@ -1548,10 +1548,6 @@ fn execute_pipeline(
             stderr_threads.push(thread::spawn(move || read_to_end(pipe)));
         }
 
-        if i == stages.len() - 1 && matches!(stdout_mode, Redirection::Capture) {
-            last_stdout = child.stdout.take();
-        }
-
         children.push(child);
     }
 
@@ -1559,6 +1555,7 @@ fn execute_pipeline(
     // stage could otherwise block on a full pipe buffer and prevent the
     // child from exiting. Non-Capture modes route stdout elsewhere and
     // there is nothing to drain.
+    let last_stdout = children.last_mut().and_then(|child| child.stdout.take());
     let stdout_thread = last_stdout.map(|pipe| thread::spawn(move || read_to_end(pipe)));
 
     let start = Instant::now();
@@ -1704,7 +1701,8 @@ fn spawn_pipeline_stages(
     display: CmdDisplay,
 ) -> Result<SpawnedProcess, RunError> {
     let mut pipes: Vec<(Option<PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
-    for _ in 0..stages.len() - 1 {
+    // One pipe between each adjacent pair of stages.
+    for _ in stages.iter().skip(1) {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),
             source,
