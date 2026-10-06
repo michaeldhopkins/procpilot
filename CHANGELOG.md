@@ -4,6 +4,18 @@ All notable changes to procpilot are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-06
+
+### Breaking changes
+
+- **Dropping a `SpawnedProcess` kills and reaps every stage still running.** It used to leave them running, unlike `AsyncSpawnedProcess`, which already killed on drop. Migration: to let a child outlive its handle, spawn it with `std::process::Command`.
+
+### Fixes
+
+- A one-shot `StdinData::Reader` or `AsyncReader` taken by an earlier attempt or clone now leaves later runs an empty stdin, as documented. They inherited the parent's stdin, where a child that reads stdin could wait forever.
+- A bare program name is resolved through `PATH` once, then spawned by path.
+- `CmdDisplay` quotes a program that a shell would read as an assignment or a reserved word.
+
 ## [0.8.0] - 2026-05-18
 
 ### Breaking changes
