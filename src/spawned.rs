@@ -31,6 +31,8 @@ use crate::cmd::RunOutput;
 use crate::cmd_display::CmdDisplay;
 use crate::error::{RunError, truncate_suffix, truncate_suffix_string};
 
+mod read;
+
 /// Handle to one or more spawned subprocesses (a single command or a pipeline).
 ///
 /// Lifecycle methods ([`wait`](Self::wait), [`kill`](Self::kill),
@@ -65,10 +67,10 @@ use crate::error::{RunError, truncate_suffix, truncate_suffix_string};
 ///
 /// # Dropping without waiting
 ///
-/// Dropping a `SpawnedProcess` without calling [`wait`](Self::wait) leaves
-/// the child(ren) to be reaped by the OS; a valid pattern for
-/// fire-and-forget jobs but may leave short-lived zombies until parent
-/// exit on Unix.
+/// Dropping a `SpawnedProcess` kills every stage still running and reaps
+/// it, as `AsyncSpawnedProcess` does, so a
+/// handle lost to an early return or a panic leaves no child behind. To
+/// let a child outlive its handle, spawn it with `std::process::Command`.
 pub struct SpawnedProcess {
     children: Vec<Arc<SharedChild>>,
     stdout: Mutex<StdoutState>,
@@ -348,50 +350,23 @@ fn pipefail_status(statuses: &[ExitStatus]) -> ExitStatus {
     chosen
 }
 
+impl Drop for SpawnedProcess {
+    fn drop(&mut self) {
+        for c in &self.children {
+            if matches!(c.try_wait(), Ok(None)) {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for SpawnedProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpawnedProcess")
             .field("command", &self.command)
             .field("pids", &self.pids())
             .finish()
-    }
-}
-
-/// Read directly from the rightmost stage's stdout.
-///
-/// On first read, takes ownership of stdout internally (so subsequent
-/// [`take_stdout`](SpawnedProcess::take_stdout) calls return `None`).
-/// Reads return `Ok(0)` when stdout closes (EOF). Call
-/// [`wait`](SpawnedProcess::wait) after EOF to surface the exit status.
-impl Read for SpawnedProcess {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        read_via_handle(self, buf)
-    }
-}
-
-/// Dual impl enabling `(&proc).read(…)`. Lets one thread read while another
-/// holds the handle by reference and calls [`kill`](SpawnedProcess::kill)
-/// or [`wait`](SpawnedProcess::wait).
-impl Read for &SpawnedProcess {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        read_via_handle(self, buf)
-    }
-}
-
-fn read_via_handle(p: &SpawnedProcess, buf: &mut [u8]) -> io::Result<usize> {
-    let mut guard = p
-        .stdout
-        .lock()
-        .map_err(|_| io::Error::other("stdout mutex poisoned"))?;
-    if matches!(*guard, StdoutState::NotTaken) {
-        match p.children.last().and_then(|c| c.take_stdout()) {
-            Some(pipe) => *guard = StdoutState::Cached(pipe),
-            None => *guard = StdoutState::GivenAway,
-        }
-    }
-    match &mut *guard {
-        StdoutState::Cached(pipe) => pipe.read(buf),
-        StdoutState::NotTaken | StdoutState::GivenAway => Ok(0),
     }
 }
 

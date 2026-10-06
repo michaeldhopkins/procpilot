@@ -95,6 +95,11 @@ name = "pp_arg0"
 path = "src/bin/pp_arg0.rs"
 required-features = ["mock-binaries"]
 
+[[bin]]
+name = "pp_rerun_reader"
+path = "src/bin/pp_rerun_reader.rs"
+required-features = ["mock-binaries"]
+
 # Integration test that depends on the mock binaries. Skipped when
 # `mock-binaries` is off so `cargo test` (without feature flag) still
 # works for unit tests.
@@ -116,6 +121,11 @@ required-features = ["mock-binaries"]
 [[test]]
 name = "program_resolution"
 path = "tests/program_resolution.rs"
+required-features = ["mock-binaries"]
+
+[[test]]
+name = "leaks"
+path = "tests/leaks.rs"
 required-features = ["mock-binaries"]
 
 [[test]]

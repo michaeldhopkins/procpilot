@@ -26,8 +26,9 @@ use std::io::Read;
 ///   configured to retry, each attempt re-feeds the same bytes (internally
 ///   the buffer is `Arc`-shared for cheap clones).
 /// - [`Reader`](Self::Reader): one-shot. The first run attempt consumes
-///   the reader; subsequent retries or cloned-then-run attempts see no
-///   stdin. Avoid `.retry()` with a reader unless you understand this.
+///   the reader; subsequent retries or cloned-then-run attempts get an
+///   empty stdin (immediate EOF), never the parent's. Avoid `.retry()`
+///   with a reader unless you understand this.
 /// - [`AsyncReader`](Self::AsyncReader): one-shot like `Reader`. Only
 ///   usable on the async path ([`Cmd::run_async`](crate::Cmd::run_async) /
 ///   [`Cmd::spawn_async`](crate::Cmd::spawn_async)). Passing it to the

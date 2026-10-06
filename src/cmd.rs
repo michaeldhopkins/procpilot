@@ -216,7 +216,7 @@ impl CancelControl {
 /// For `Bytes`, clones share the same buffer via `Arc<Vec<u8>>` — cheap and
 /// lets every retry or clone re-feed the same data. For `Reader`, clones
 /// share a `Mutex<Option<…>>` — whichever attempt runs first takes the
-/// reader; subsequent attempts (or concurrent clones) see `None`.
+/// reader; later attempts and clones get an empty stdin, never the parent's.
 #[derive(Clone)]
 pub(crate) enum SharedStdin {
     Bytes(Arc<Vec<u8>>),
@@ -259,9 +259,9 @@ impl SharedStdin {
             Self::Reader(r) => match r.lock() {
                 Ok(mut guard) => match guard.take() {
                     Some(reader) => SyncStdinForAttempt::Reader(reader),
-                    None => SyncStdinForAttempt::None,
+                    None => SyncStdinForAttempt::Bytes(Arc::default()),
                 },
-                Err(_) => SyncStdinForAttempt::None,
+                Err(_) => SyncStdinForAttempt::Bytes(Arc::default()),
             },
             #[cfg(feature = "tokio")]
             Self::AsyncReader(_) => {
@@ -285,16 +285,16 @@ impl SharedStdin {
             Self::Reader(r) => match r.lock() {
                 Ok(mut guard) => match guard.take() {
                     Some(reader) => AsyncStdinForAttempt::Reader(reader),
-                    None => AsyncStdinForAttempt::None,
+                    None => AsyncStdinForAttempt::Bytes(Arc::default()),
                 },
-                Err(_) => AsyncStdinForAttempt::None,
+                Err(_) => AsyncStdinForAttempt::Bytes(Arc::default()),
             },
             Self::AsyncReader(r) => match r.lock() {
                 Ok(mut guard) => match guard.take() {
                     Some(reader) => AsyncStdinForAttempt::AsyncReader(reader),
-                    None => AsyncStdinForAttempt::None,
+                    None => AsyncStdinForAttempt::Bytes(Arc::default()),
                 },
-                Err(_) => AsyncStdinForAttempt::None,
+                Err(_) => AsyncStdinForAttempt::Bytes(Arc::default()),
             },
         }
     }

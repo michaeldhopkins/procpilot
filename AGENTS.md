@@ -114,7 +114,7 @@ fuzz/burst.sh fuzz/target/aarch64-apple-darwin/release/cmd_display cmd_display 6
 
 cargo-mutants, per the `rust-mutation-testing` skill; this section is only what is true of procpilot. `.cargo/mutants.toml` makes a bare `cargo mutants` work: it turns on all features (the integration tests need `mock-binaries`, `tokio` and `testing`), leaves out the `pp_*` mock binaries (test fixtures, never shipped) and `src/fuzz_api.rs` (compiled only under `cargo fuzz`), and excludes six equivalent or timing-only mutants (four patterns), each with its reason.
 
-**CI** (`.github/workflows/mutants.yml`, not a gate): `--in-diff` on every PR and push to main, and on pushes to main one rotating slice, `--shard (run_number % 4)/4`. Both run `-j2` with stdin closed (see below). No whole-tree run and no schedule.
+**CI** (`.github/workflows/mutants.yml`, not a gate): `--in-diff` on every PR and push to main, and on pushes to main one rotating slice, `--shard (run_number % 4)/4`. Both run `-j2` with stdin closed. No whole-tree run and no schedule.
 
 **Adopted 2026-09-27.** 481 mutants after exclusions (`cargo mutants --list | wc -l`). No whole-tree sweep: slices 0/4 and 1/4 were run and burned down; 2/4 (error, spawned, testing, stdin, retry, runner) and 3/4 (`src/cmd/async_cmd.rs`, `src/cmd/program.rs`) will be covered by CI's rotation.
 
@@ -129,4 +129,10 @@ cargo-mutants, per the `rust-mutation-testing` skill; this section is only what 
 - `replace - with + / with / in execute_pipeline` and `spawn_pipeline_stages` (and their async twins) at `for _ in 0..stages.len() - 1`: one extra close-on-exec pipe is opened and dropped. Writing the range as `1..stages.len()` removes these mutants. That is a source change, so it belongs in a release.
 - `replace && with || in execute_pipeline` (and its async twin) at `if i == stages.len() - 1 && matches!(stdout_mode, Capture)`: `child.stdout` is `Some` only for a piped (Capture) last stage, so the extra `take()` calls return `None`.
 
-**Stdin must be closed for local runs.** `run_async_async_reader_is_one_shot_across_clones` runs a second clone whose one-shot reader is already taken. That clone then inherits the test process's stdin, and its `pp_cat` reads to EOF. If that stdin stays open and silent, EOF never comes and the suite hangs at 0% CPU: seen twice on 2026-09-27 from an agent's shell, whose stdin is a socket (45 other runs from the same shell passed). With stdin at `/dev/null` the second clone reads nothing, as the test expects. Run `cargo mutants ... < /dev/null` (CI does). Whether a consumed reader should give the child an empty stdin rather than the parent's is an open question for the library; the test only encodes the current behaviour.
+**No child outlives its test.** On 2026-10-06 three `pp_cat`s from a cargo-mutants copy ran orphaned for 90 minutes. A one-shot reader taken by an earlier run left later runs the parent's stdin, so a second `pp_cat` most likely waited on the agent's silent socket; it now gets an empty stdin (`tests/leaks.rs`). Three layers keep children bounded, and new tests use them:
+- `tests/support/reaped.rs`: `Reaped` wraps a `SpawnedProcess` and kills and reaps it on drop; `wait_bounded` fails at a 10s deadline instead of hanging. Async tests wrap waits in `bounded(...)`; a dropped `AsyncSpawnedProcess` kills its children. A dropped `SpawnedProcess` does too, since 0.9.0.
+- `src/bin/support/orphan.rs`: every mock that can block (`pp_cat`, `pp_sleep`, `pp_status`, `pp_spam`, `pp_child_grandchild`) exits within 100ms of its parent dying, which covers a test process SIGKILLed by cargo-mutants' timeout. A new blocking mock calls `orphan::exit_when_orphaned()` first.
+- Never a bare wait on a child that could hang: poll against a deadline, or use `wait_timeout`.
+
+CI still runs `cargo mutants ... < /dev/null`, which costs nothing.
+
