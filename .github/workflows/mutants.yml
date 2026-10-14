@@ -142,6 +142,7 @@ jobs:
             echo "::warning::Mutants skipped: $selected selected, over the limit of $MAX_SELECTED. A diff this broad is a sweep rather than a changed-code gate and would exceed the job timeout. Nothing was mutation-tested for this push."
             exit 0
           fi
+          # scripts/mutants-run.sh decides the verdict from mutants.out/missed.txt, so exit 3 passes only when nothing was missed, and stops cargo-mutants at a time budget.
           # Exit codes worth knowing when this goes red (see the book):
           #   2  a mutant was MISSED — the finding; write a test or justify it
           #   3  a mutant TIMED OUT — usually an injected infinite loop, which is
@@ -163,11 +164,7 @@ jobs:
           # timeout is the wasted 45 minutes, not a lost report.
           # -j2 and stdin closed: see the slice job.
           rc=0
-          cargo mutants --no-shuffle -vV -j2 --in-diff mutants.diff < /dev/null || rc=$?
-          if [ "$rc" -eq 3 ]; then
-            echo "::notice::timeouts counted as caught; see mutants.out/timeout.txt"
-            rc=0
-          fi
+          scripts/mutants-run.sh --no-shuffle -vV -j2 --in-diff mutants.diff < /dev/null || rc=$?
           exit "$rc"
 
       # Put the finding in the run summary so a reviewer sees it without
@@ -290,11 +287,7 @@ jobs:
           echo "$k" > mutants-slice.txt
           echo "Slice $k of $SLICES"
           rc=0
-          cargo mutants --no-shuffle -vV -j2 --shard "$k/$SLICES" < /dev/null || rc=$?
-          if [ "$rc" -eq 3 ]; then
-            echo "::notice::timeouts counted as caught; see mutants.out/timeout.txt"
-            rc=0
-          fi
+          MUTANTS_BUDGET_PASSES=1 scripts/mutants-run.sh --no-shuffle -vV -j2 --shard "$k/$SLICES" < /dev/null || rc=$?
           exit "$rc"
 
       - name: Summarise
