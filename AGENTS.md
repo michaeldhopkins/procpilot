@@ -136,3 +136,5 @@ cargo-mutants, per the `rust-mutation-testing` skill; this section is only what 
 
 CI still runs `cargo mutants ... < /dev/null`, which costs nothing.
 
+
+Dependencies move through the owner's `procpilot-deps` upkeep job, never Dependabot.
