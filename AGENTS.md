@@ -65,7 +65,11 @@ CI runs on push/PR:
 - `cargo clippy --locked --all-targets -- -D warnings`
 - `cargo clippy --locked --no-default-features --all-targets -- -D warnings`
 - `cargo doc --no-deps` with `RUSTDOCFLAGS="-D warnings"` (catches broken doc links)
-- `cargo deny check licenses`
+- `cargo fmt --all --check`, for the root crate and `fuzz/`
+- `cargo deny check` (advisories, bans, licenses, sources), then `cargo machete`
+- `cargo check` on the declared `rust-version` (the `msrv` job reads it from `Cargo.toml`)
+
+The toolchain is pinned exactly in `rust-toolchain.toml` (clippy and rustfmt included); move it to each new stable within 30 days. Every workflow sets `permissions`, `concurrency` and a `timeout-minutes` on each job, and `tests/ci_rules.rs` fails when one does not. `tests/lint_suppressions.rs` pins `#[allow]` sites and loosened `clippy.toml` thresholds (only down), and `tests/properties.rs` requires every source file to be classified in `tests/properties.toml`. What is still owed is in `TODO.md`.
 
 Fuzzing has its own workflows; see "Fuzzing" below. So does mutation testing; see "Mutation testing".
 
