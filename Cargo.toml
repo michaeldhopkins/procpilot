@@ -17,6 +17,12 @@ exclude = [
     "fuzz/",
     # Reads fuzz/ and .github/, which are not in the package.
     "tests/fuzz_targets_wired.rs",
+    # Read .github/, deny.toml and clippy.toml, which are not in the package.
+    "tests/ci_rules.rs",
+    "tests/lint_suppressions.rs",
+    "tests/properties.rs",
+    "tests/properties.toml",
+    "tests/fixtures/",
     "AGENTS.md",
     "CLAUDE.md",
     "cliff.toml",
@@ -163,6 +169,7 @@ proptest = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
+toml = "0.8"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "sync", "io-util"] }
 
 [lints.rust]
@@ -170,14 +177,16 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", 
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [lints.clippy]
-struct-excessive-bools = "deny"
-fn-params-excessive-bools = "deny"
-collapsible-if = "deny"
-too-many-arguments = "deny"
-needless-range-loop = "deny"
+struct_excessive_bools = "deny"
+fn_params_excessive_bools = "deny"
+collapsible_if = "deny"
+too_many_arguments = "deny"
+needless_range_loop = "deny"
 extend_with_drain = "deny"
 unwrap_used = "deny"
+dbg_macro = "deny"
+undocumented_unsafe_blocks = "deny"
 match_bool = "warn"
 bool_to_int_with_if = "warn"
-cognitive-complexity = "warn"
-too-many-lines = "warn"
+cognitive_complexity = "warn"
+too_many_lines = "warn"
