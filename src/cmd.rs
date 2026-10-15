@@ -303,10 +303,7 @@ impl SharedStdin {
 impl fmt::Debug for SharedStdin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bytes(b) => f
-                .debug_struct("Bytes")
-                .field("len", &b.len())
-                .finish(),
+            Self::Bytes(b) => f.debug_struct("Bytes").field("len", &b.len()).finish(),
             Self::Reader(_) => f.debug_struct("Reader").finish_non_exhaustive(),
             #[cfg(feature = "tokio")]
             Self::AsyncReader(_) => f.debug_struct("AsyncReader").finish_non_exhaustive(),
@@ -878,24 +875,10 @@ impl Cmd {
         }
 
         let cancel_ref = cancel.as_ref();
-        let op = |stdin_attempt: SyncStdinForAttempt, per_attempt: Option<Duration>| match &self
-            .tree
-        {
-            CmdTree::Single(single) => execute_single(
-                single,
-                &self.stdout_mode,
-                &self.stderr_mode,
-                self.before_spawn.as_ref(),
-                &display,
-                stdin_attempt,
-                per_attempt,
-                cancel_ref,
-            ),
-            CmdTree::Pipe(_, _) => {
-                let mut stages = Vec::new();
-                self.tree.flatten(&mut stages);
-                execute_pipeline(
-                    &stages,
+        let op =
+            |stdin_attempt: SyncStdinForAttempt, per_attempt: Option<Duration>| match &self.tree {
+                CmdTree::Single(single) => execute_single(
+                    single,
                     &self.stdout_mode,
                     &self.stderr_mode,
                     self.before_spawn.as_ref(),
@@ -903,9 +886,22 @@ impl Cmd {
                     stdin_attempt,
                     per_attempt,
                     cancel_ref,
-                )
-            }
-        };
+                ),
+                CmdTree::Pipe(_, _) => {
+                    let mut stages = Vec::new();
+                    self.tree.flatten(&mut stages);
+                    execute_pipeline(
+                        &stages,
+                        &self.stdout_mode,
+                        &self.stderr_mode,
+                        self.before_spawn.as_ref(),
+                        &display,
+                        stdin_attempt,
+                        per_attempt,
+                        cancel_ref,
+                    )
+                }
+            };
 
         match retry {
             None => op(
@@ -1571,14 +1567,9 @@ fn execute_pipeline(
             continue;
         }
         let stage_start = Instant::now();
-        let per_stage_timeout =
-            timeout.map(|budget| budget.saturating_sub(start.elapsed()));
-        let stage_outcome = wait_single_with_cancel(
-            &mut children[i],
-            per_stage_timeout,
-            cancel,
-            stage_start,
-        );
+        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome =
+            wait_single_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start);
         if matches!(stage_outcome, Outcome::Cancelled) {
             // Kill every other stage right away so they don't continue running.
             for (j, c) in children.iter_mut().enumerate() {
@@ -1860,7 +1851,10 @@ mod tests {
 
     #[test]
     fn secret_flag_propagates_through_pipe() {
-        let cmd = Cmd::new("docker").arg("login").secret().pipe(Cmd::new("jq"));
+        let cmd = Cmd::new("docker")
+            .arg("login")
+            .secret()
+            .pipe(Cmd::new("jq"));
         let d = cmd.display();
         assert!(d.is_secret());
         assert_eq!(d.to_string(), "docker <secret> | jq <secret>");
@@ -1868,16 +1862,26 @@ mod tests {
 
     #[test]
     fn env_builder_targets_rightmost() {
-        let cmd = Cmd::new("a").env("X", "1").pipe(Cmd::new("b")).env("Y", "2");
+        let cmd = Cmd::new("a")
+            .env("X", "1")
+            .pipe(Cmd::new("b"))
+            .env("Y", "2");
         let mut stages = Vec::new();
         cmd.tree.flatten(&mut stages);
-        assert_eq!(stages[0].envs, vec![(OsString::from("X"), OsString::from("1"))]);
-        assert_eq!(stages[1].envs, vec![(OsString::from("Y"), OsString::from("2"))]);
+        assert_eq!(
+            stages[0].envs,
+            vec![(OsString::from("X"), OsString::from("1"))]
+        );
+        assert_eq!(
+            stages[1].envs,
+            vec![(OsString::from("Y"), OsString::from("2"))]
+        );
     }
 
     #[test]
     fn display_renders_pipeline() {
-        let cmd = Cmd::new("git").args(["log", "--oneline"])
+        let cmd = Cmd::new("git")
+            .args(["log", "--oneline"])
             .pipe(Cmd::new("grep").arg("feat"))
             .pipe(Cmd::new("head").arg("-5"));
         let d = cmd.display();
@@ -1945,7 +1949,11 @@ mod tests {
 
     #[test]
     fn display_respects_secret_via_cmd_display() {
-        let cmd = Cmd::new("docker").arg("login").arg("-p").arg("tok").secret();
+        let cmd = Cmd::new("docker")
+            .arg("login")
+            .arg("-p")
+            .arg("tok")
+            .secret();
         assert_eq!(format!("{cmd}"), "docker <secret>");
     }
 
@@ -1953,8 +1961,18 @@ mod tests {
     fn to_commands_returns_all_stages_left_to_right() {
         let cmd = Cmd::new("a").pipe(Cmd::new("b")).pipe(Cmd::new("c"));
         let cmds = cmd.to_commands();
-        let progs: Vec<_> = cmds.iter().map(|c| c.get_program().to_os_string()).collect();
-        assert_eq!(progs, vec![OsString::from("a"), OsString::from("b"), OsString::from("c")]);
+        let progs: Vec<_> = cmds
+            .iter()
+            .map(|c| c.get_program().to_os_string())
+            .collect();
+        assert_eq!(
+            progs,
+            vec![
+                OsString::from("a"),
+                OsString::from("b"),
+                OsString::from("c")
+            ]
+        );
     }
 
     #[test]
@@ -1969,7 +1987,10 @@ mod tests {
         let mut s2 = Vec::new();
         c2.tree.flatten(&mut s2);
         assert_eq!(s1[0].args, vec![OsString::from("status")]);
-        assert_eq!(s2[0].args, vec![OsString::from("log"), OsString::from("-1")]);
+        assert_eq!(
+            s2[0].args,
+            vec![OsString::from("log"), OsString::from("-1")]
+        );
     }
 
     #[test]
@@ -1977,7 +1998,8 @@ mod tests {
         // The reader must only produce data once — whichever attempt takes
         // it first wins; subsequent clones/retries see no stdin.
         use std::io::Cursor;
-        let original = Cmd::new("x").stdin(StdinData::from_reader(Cursor::new(b"payload".to_vec())));
+        let original =
+            Cmd::new("x").stdin(StdinData::from_reader(Cursor::new(b"payload".to_vec())));
         let clone_a = original.clone();
         let clone_b = original.clone();
 

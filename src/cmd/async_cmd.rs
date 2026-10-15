@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 
 use super::{
-    BeforeSpawnHook, CANCEL_POLL_INTERVAL, CancelControl, Cmd, CmdTree, Outcome, RunOutput,
-    SingleCmd, AsyncStdinForAttempt, attempt_stdin_async, combine_outcomes, finalize_outcome,
+    AsyncStdinForAttempt, BeforeSpawnHook, CANCEL_POLL_INTERVAL, CancelControl, Cmd, CmdTree,
+    Outcome, RunOutput, SingleCmd, attempt_stdin_async, combine_outcomes, finalize_outcome,
     reject_non_capture_stdout_on_spawn,
 };
 use crate::async_spawned::AsyncSpawnedProcess;
@@ -594,8 +594,7 @@ async fn execute_pipeline_async(
 ) -> Result<RunOutput, RunError> {
     debug_assert!(stages.len() >= 2);
 
-    let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> =
-        Vec::new();
+    let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
     for _ in 1..stages.len() {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),
@@ -674,15 +673,10 @@ async fn execute_pipeline_async(
             continue;
         }
         let stage_start = Instant::now();
-        let per_stage_timeout =
-            timeout.map(|budget| budget.saturating_sub(start.elapsed()));
-        let stage_outcome = wait_single_async_with_cancel(
-            &mut children[i],
-            per_stage_timeout,
-            cancel,
-            stage_start,
-        )
-        .await;
+        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome =
+            wait_single_async_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start)
+                .await;
         if matches!(stage_outcome, Outcome::Cancelled) {
             for (j, c) in children.iter_mut().enumerate() {
                 if j != i {
@@ -742,11 +736,7 @@ async fn spawn_single_async(
         None
     };
 
-    Ok(AsyncSpawnedProcess::new_single(
-        child,
-        stderr_task,
-        display,
-    ))
+    Ok(AsyncSpawnedProcess::new_single(child, stderr_task, display))
 }
 
 async fn spawn_pipeline_async(
@@ -756,8 +746,7 @@ async fn spawn_pipeline_async(
     mut stdin: AsyncStdinForAttempt,
     display: CmdDisplay,
 ) -> Result<AsyncSpawnedProcess, RunError> {
-    let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> =
-        Vec::new();
+    let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> = Vec::new();
     for _ in 1..stages.len() {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),

@@ -45,7 +45,9 @@ fn run_async_twice(cat: &str) -> procpilot::RunOutput {
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let cmd = Cmd::new(cat).stdin(StdinData::from_async_reader(Cursor::new(b"taken once".to_vec())));
+        let cmd = Cmd::new(cat).stdin(StdinData::from_async_reader(Cursor::new(
+            b"taken once".to_vec(),
+        )));
         cmd.clone().run_async().await.expect("first run");
         cmd.run_async().await.expect("second run")
     })

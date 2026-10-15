@@ -76,12 +76,9 @@ impl StdinData {
     /// async source.
     #[cfg(feature = "tokio")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-    pub fn from_async_reader<R: tokio::io::AsyncRead + Send + Unpin + 'static>(
-        reader: R,
-    ) -> Self {
+    pub fn from_async_reader<R: tokio::io::AsyncRead + Send + Unpin + 'static>(reader: R) -> Self {
         Self::AsyncReader(Box::new(reader))
     }
-
 }
 
 impl std::fmt::Debug for StdinData {
@@ -183,10 +180,7 @@ mod tests {
         let bytes_dbg = format!("{:?}", StdinData::Bytes(vec![0; 100]));
         assert!(bytes_dbg.contains("100"));
 
-        let reader_dbg = format!(
-            "{:?}",
-            StdinData::from_reader(Cursor::new(vec![0u8; 100]))
-        );
+        let reader_dbg = format!("{:?}", StdinData::from_reader(Cursor::new(vec![0u8; 100])));
         assert!(reader_dbg.contains("Reader"));
         assert!(!reader_dbg.contains("100"));
     }

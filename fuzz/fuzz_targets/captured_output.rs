@@ -19,18 +19,33 @@ use procpilot::fuzz_api::{stderr_suffix, stdout_suffix};
 fn check(bytes: &[u8]) {
     let kept = stdout_suffix(bytes.to_vec());
     let want = &bytes[bytes.len().saturating_sub(STREAM_SUFFIX_SIZE)..];
-    assert_eq!(kept.as_slice(), want, "stdout must keep exactly the last STREAM_SUFFIX_SIZE bytes");
+    assert_eq!(
+        kept.as_slice(),
+        want,
+        "stdout must keep exactly the last STREAM_SUFFIX_SIZE bytes"
+    );
 
     let decoded = String::from_utf8_lossy(bytes);
     let kept = stderr_suffix(bytes);
-    assert!(decoded.ends_with(kept.as_str()), "stderr must be a tail of the decoded output");
+    assert!(
+        decoded.ends_with(kept.as_str()),
+        "stderr must be a tail of the decoded output"
+    );
     if decoded.len() <= STREAM_SUFFIX_SIZE {
         assert_eq!(kept, decoded, "stderr within the cap must be kept whole");
     } else {
-        assert!(kept.len() <= STREAM_SUFFIX_SIZE, "stderr kept {} bytes, over the cap", kept.len());
+        assert!(
+            kept.len() <= STREAM_SUFFIX_SIZE,
+            "stderr kept {} bytes, over the cap",
+            kept.len()
+        );
         // The cut moves forward to the next character boundary, and a UTF-8 character is at most
         // four bytes, so at most three bytes under the cap are lost to it.
-        assert!(kept.len() + 3 >= STREAM_SUFFIX_SIZE, "stderr kept {} bytes, far under the cap", kept.len());
+        assert!(
+            kept.len() + 3 >= STREAM_SUFFIX_SIZE,
+            "stderr kept {} bytes, far under the cap",
+            kept.len()
+        );
     }
 }
 

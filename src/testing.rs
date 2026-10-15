@@ -169,7 +169,13 @@ impl MockRunner {
     pub fn expect(self, display: impl Into<String>, result: MockResult) -> Self {
         let display = display.into();
         let desc = format!("display = {display:?}");
-        self.push(Matcher::Display(display), Responder::Once { result: Some(result) }, desc)
+        self.push(
+            Matcher::Display(display),
+            Responder::Once {
+                result: Some(result),
+            },
+            desc,
+        )
     }
 
     /// Register an expectation matching by predicate. Matches exactly once.
@@ -179,7 +185,9 @@ impl MockRunner {
     {
         self.push(
             Matcher::Predicate(Box::new(matcher)),
-            Responder::Once { result: Some(result) },
+            Responder::Once {
+                result: Some(result),
+            },
             "<predicate>".to_string(),
         )
     }
@@ -230,7 +238,9 @@ impl MockRunner {
         let desc = format!("display = {display:?} (∞)");
         self.push(
             Matcher::Display(display),
-            Responder::Unlimited { factory: Box::new(factory) },
+            Responder::Unlimited {
+                factory: Box::new(factory),
+            },
             desc,
         )
     }
@@ -244,7 +254,9 @@ impl MockRunner {
     {
         self.push(
             Matcher::Predicate(Box::new(matcher)),
-            Responder::Unlimited { factory: Box::new(factory) },
+            Responder::Unlimited {
+                factory: Box::new(factory),
+            },
             "<predicate> (∞)".to_string(),
         )
     }
@@ -270,10 +282,7 @@ impl MockRunner {
     /// if they were hit at least once; unbounded responders don't imply
     /// "must be hit many times".
     pub fn verify(&self) -> Result<(), String> {
-        let exps = self
-            .expectations
-            .lock()
-            .expect("MockRunner mutex poisoned");
+        let exps = self.expectations.lock().expect("MockRunner mutex poisoned");
         let unmet: Vec<_> = exps.iter().filter(|e| e.calls == 0).collect();
         if unmet.is_empty() {
             Ok(())
@@ -302,10 +311,7 @@ impl Runner for MockRunner {
         // `panic_on_no_match` panic unwinds with the guard alive and
         // poisons the mutex.
         let no_match_msg = {
-            let mut exps = self
-                .expectations
-                .lock()
-                .expect("MockRunner mutex poisoned");
+            let mut exps = self.expectations.lock().expect("MockRunner mutex poisoned");
             for exp in exps.iter_mut() {
                 if exp.responder.exhausted() {
                     continue;

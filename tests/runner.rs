@@ -50,7 +50,9 @@ fn captures_stdout_bytes_on_failure() {
 
 #[test]
 fn missing_binary_is_spawn_failure() {
-    let err = Cmd::new("nonexistent_binary_xyz_42").run().expect_err("fail");
+    let err = Cmd::new("nonexistent_binary_xyz_42")
+        .run()
+        .expect_err("fail");
     assert!(err.is_spawn_failure());
 }
 
@@ -123,10 +125,7 @@ fn stdin_reader_one_shot() {
 
 #[test]
 fn stdin_vec_bytes() {
-    let out = Cmd::new(PP_CAT)
-        .stdin(vec![b'h', b'i'])
-        .run()
-        .expect("ok");
+    let out = Cmd::new(PP_CAT).stdin(vec![b'h', b'i']).run().expect("ok");
     assert_eq!(out.stdout_lossy(), "hi");
 }
 
@@ -303,8 +302,8 @@ fn binary_version_none_for_missing() {
 
 #[test]
 fn before_spawn_hook_invoked() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let count = Arc::new(AtomicUsize::new(0));
     let c = count.clone();
     let out = Cmd::new(PP_ECHO)
@@ -450,7 +449,12 @@ fn nonzero_exit_carries_full_attempt_count_on_retry_exhaustion() {
     assert!(err.is_non_zero_exit());
     // Default backon ExponentialBuilder retries `with_max_times(3)`, so
     // the initial call + 3 retries = 4 attempts total.
-    assert_eq!(err.attempts(), 4, "expected 4 attempts, got {}", err.attempts());
+    assert_eq!(
+        err.attempts(),
+        4,
+        "expected 4 attempts, got {}",
+        err.attempts()
+    );
 }
 
 #[test]
@@ -536,8 +540,14 @@ fn cancel_waits_out_the_grace_period_before_sigkill() {
         .expect_err("fail");
     let elapsed = start.elapsed();
     assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
-    assert!(elapsed >= grace, "SIGKILL came before the {grace:?} grace ran out: {elapsed:?}");
-    assert!(elapsed < Duration::from_secs(5), "SIGKILL never came: {elapsed:?}");
+    assert!(
+        elapsed >= grace,
+        "SIGKILL came before the {grace:?} grace ran out: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "SIGKILL never came: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -557,5 +567,9 @@ fn an_unset_cancel_flag_still_sleeps_through_retry_backoff() {
         .run()
         .expect_err("fail");
     assert_eq!(err.attempts(), 4);
-    assert!(start.elapsed() >= Duration::from_millis(700), "backoff was skipped: {:?}", start.elapsed());
+    assert!(
+        start.elapsed() >= Duration::from_millis(700),
+        "backoff was skipped: {:?}",
+        start.elapsed()
+    );
 }

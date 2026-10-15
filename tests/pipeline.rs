@@ -131,11 +131,13 @@ fn args_after_pipe_target_rightmost() {
 
 #[test]
 fn spawn_on_pipeline_returns_all_pids() {
-    let proc = Reaped(Cmd::new(PP_ECHO)
-        .arg("hi")
-        .pipe(Cmd::new(PP_CAT))
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_ECHO)
+            .arg("hi")
+            .pipe(Cmd::new(PP_CAT))
+            .spawn()
+            .expect("spawn"),
+    );
     assert!(proc.is_pipeline());
     assert_eq!(proc.pids().len(), 2);
     let out = proc.wait_bounded().expect("wait");
@@ -144,10 +146,12 @@ fn spawn_on_pipeline_returns_all_pids() {
 
 #[test]
 fn spawn_pipeline_bidirectional_take_stdin_and_stdout() {
-    let proc = Reaped(Cmd::new(PP_CAT)
-        .pipe(Cmd::new(PP_CAT))
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_CAT)
+            .pipe(Cmd::new(PP_CAT))
+            .spawn()
+            .expect("spawn"),
+    );
     let mut stdin = proc.take_stdin().expect("stdin");
     let mut stdout = proc.take_stdout().expect("stdout");
 
@@ -165,11 +169,13 @@ fn spawn_pipeline_bidirectional_take_stdin_and_stdout() {
 
 #[test]
 fn spawn_pipeline_kill_sends_to_all_stages() {
-    let proc = Reaped(Cmd::new(PP_SLEEP)
-        .arg("10000")
-        .pipe(Cmd::new(PP_CAT))
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_SLEEP)
+            .arg("10000")
+            .pipe(Cmd::new(PP_CAT))
+            .spawn()
+            .expect("spawn"),
+    );
     proc.kill().expect("kill");
     // If kill only reached the first stage, wait would hang on pp_cat waiting
     // for its stdin to close — so this line is the real assertion.
@@ -178,11 +184,13 @@ fn spawn_pipeline_kill_sends_to_all_stages() {
 
 #[test]
 fn spawn_pipeline_pipefail_on_wait() {
-    let proc = Reaped(Cmd::new(PP_ECHO)
-        .arg("x")
-        .pipe(Cmd::new(PP_STATUS).arg("3"))
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_ECHO)
+            .arg("x")
+            .pipe(Cmd::new(PP_STATUS).arg("3"))
+            .spawn()
+            .expect("spawn"),
+    );
     let err = proc.wait_bounded().expect_err("should fail");
     assert!(err.is_non_zero_exit());
     assert_eq!(err.exit_status().and_then(|s| s.code()), Some(3));
@@ -230,7 +238,9 @@ fn spawn_pipeline_spawn_failure_kills_earlier_stages() {
 
 #[test]
 fn display_renders_shell_style_pipeline() {
-    let cmd = Cmd::new("git").arg("log").pipe(Cmd::new("grep").arg("feat"));
+    let cmd = Cmd::new("git")
+        .arg("log")
+        .pipe(Cmd::new("grep").arg("feat"));
     let d = cmd.display();
     assert_eq!(d.to_string(), "git log | grep feat");
 }
@@ -290,11 +300,13 @@ fn cancel_pre_set_skips_pipeline_spawn() {
 
 #[test]
 fn spawned_pipeline_feeds_stdin_to_the_first_stage() {
-    let proc = Reaped(Cmd::new(PP_CAT)
-        .stdin("fed to stage one\n")
-        .pipe(Cmd::new(PP_CAT))
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_CAT)
+            .stdin("fed to stage one\n")
+            .pipe(Cmd::new(PP_CAT))
+            .spawn()
+            .expect("spawn"),
+    );
     // Bounded: if the feed went anywhere but stage one, its cat would wait for input forever.
     let out = proc
         .wait_timeout(Duration::from_secs(5))

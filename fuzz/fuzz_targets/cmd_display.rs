@@ -37,14 +37,18 @@ struct Input {
 
 /// Words a POSIX shell (and bash) reads as syntax in command position.
 const RESERVED: &[&str] = &[
-    "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then", "until", "while",
-    "function", "select", "time", "coproc",
+    "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then", "until",
+    "while", "function", "select", "time", "coproc",
 ];
 
 fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else { return false };
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
     let mut chars = name.chars();
-    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
@@ -61,7 +65,11 @@ const SPECIAL: &str = "$`\\\"'*?[]#~!&;()<>{}^";
 /// is the half of the oracle that can. The ` | ` stage separators and the `<secret>` marker are
 /// the renderer's own syntax and are taken out first.
 fn assert_no_bare_special(rendered: &str, secret: bool) {
-    let text = if secret { rendered.replace(" <secret>", "") } else { rendered.to_string() };
+    let text = if secret {
+        rendered.replace(" <secret>", "")
+    } else {
+        rendered.to_string()
+    };
     let text = text.replace(" | ", " ");
     let mut quoted = false;
     let mut chars = text.chars().peekable();
@@ -72,7 +80,10 @@ fn assert_no_bare_special(rendered: &str, secret: bool) {
             // `\'` between two quoted runs: how a single quote is written inside one.
             chars.next();
         } else if !quoted {
-            assert!(!SPECIAL.contains(c) && c != '|', "bare {c:?} in render {rendered:?}");
+            assert!(
+                !SPECIAL.contains(c) && c != '|',
+                "bare {c:?} in render {rendered:?}"
+            );
         }
     }
     assert!(!quoted, "unterminated quote in render {rendered:?}");
@@ -103,8 +114,14 @@ fuzz_target!(|input: Input| {
     for program in &programs {
         let alone = Cmd::new(program).display().to_string();
         if &alone == program {
-            assert!(!is_assignment(program), "program {program:?} rendered bare reads as an assignment");
-            assert!(!RESERVED.contains(&program.as_str()), "program {program:?} rendered bare is a reserved word");
+            assert!(
+                !is_assignment(program),
+                "program {program:?} rendered bare reads as an assignment"
+            );
+            assert!(
+                !RESERVED.contains(&program.as_str()),
+                "program {program:?} rendered bare is a reserved word"
+            );
         }
     }
 
@@ -123,5 +140,9 @@ fuzz_target!(|input: Input| {
             }
         }
     }
-    assert_eq!(shlex::split(&rendered), Some(expected), "render: {rendered:?}");
+    assert_eq!(
+        shlex::split(&rendered),
+        Some(expected),
+        "render: {rendered:?}"
+    );
 });

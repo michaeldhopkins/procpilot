@@ -131,7 +131,9 @@ mod tests {
 
     #[test]
     fn default_transient_retries_stale() {
-        assert!(default_transient(&fake_non_zero("The working copy is stale")));
+        assert!(default_transient(&fake_non_zero(
+            "The working copy is stale"
+        )));
     }
 
     #[test]

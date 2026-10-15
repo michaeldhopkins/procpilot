@@ -168,10 +168,7 @@ impl AsyncSpawnedProcess {
     /// Wait up to `timeout`. `Ok(None)` means at least one stage is still
     /// running; caller decides whether to [`kill`](Self::kill) or wait again.
     /// Idempotent once all stages have exited.
-    pub async fn wait_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<RunOutput>, RunError> {
+    pub async fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<RunOutput>, RunError> {
         match tokio::time::timeout(timeout, self.wait()).await {
             Ok(res) => res.map(Some),
             Err(_) => Ok(None),

@@ -34,10 +34,12 @@ fn spawn_wait_captures_stdout() {
 
 #[test]
 fn spawn_wait_surfaces_nonzero_exit() {
-    let proc = Reaped(Cmd::new(PP_STATUS)
-        .args(["1", "--err", "boom"])
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_STATUS)
+            .args(["1", "--err", "boom"])
+            .spawn()
+            .expect("spawn"),
+    );
     let err = proc.wait().expect_err("should fail");
     assert!(err.is_non_zero_exit());
     assert_eq!(err.stderr(), Some("boom\n"));
@@ -191,10 +193,12 @@ fn wait_is_idempotent_on_success() {
 
 #[test]
 fn wait_is_idempotent_on_failure() {
-    let proc = Reaped(Cmd::new(PP_STATUS)
-        .args(["3", "--err", "stderr-bytes", "--out", "stdout-bytes"])
-        .spawn()
-        .expect("spawn"));
+    let proc = Reaped(
+        Cmd::new(PP_STATUS)
+            .args(["3", "--err", "stderr-bytes", "--out", "stdout-bytes"])
+            .spawn()
+            .expect("spawn"),
+    );
     let first = proc.wait().expect_err("first wait fails");
     let second = proc.wait().expect_err("second wait fails");
     assert_eq!(first.exit_status().unwrap().code(), Some(3));
@@ -238,7 +242,9 @@ fn wait_timeout_none_does_not_consume_state() {
 #[test]
 fn concurrent_waits_see_same_outcome() {
     use std::sync::Arc;
-    let proc = Arc::new(Reaped(Cmd::new(PP_ECHO).arg("concurrent").spawn().expect("spawn")));
+    let proc = Arc::new(Reaped(
+        Cmd::new(PP_ECHO).arg("concurrent").spawn().expect("spawn"),
+    ));
     let p1 = proc.clone();
     let p2 = proc.clone();
     let h1 = thread::spawn(move || p1.wait().expect("wait 1"));
@@ -253,7 +259,9 @@ fn concurrent_waits_see_same_outcome() {
 fn concurrent_kill_unblocks_reader() {
     // If kill acquired a lock held by the in-flight read, this would deadlock.
     // shared_child's lock-free kill path must bypass the read path.
-    let proc = Arc::new(Reaped(Cmd::new(PP_SLEEP).arg("10000").spawn().expect("spawn")));
+    let proc = Arc::new(Reaped(
+        Cmd::new(PP_SLEEP).arg("10000").spawn().expect("spawn"),
+    ));
     let stdout = proc.take_stdout().expect("stdout");
     let killer = proc.clone();
     let handle = thread::spawn(move || {

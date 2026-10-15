@@ -278,14 +278,8 @@ impl SpawnedProcess {
     /// Holds the `finalized` lock for the entire finalize sequence so
     /// concurrent callers can't race on draining stderr/stdout; whoever
     /// gets the lock first fills the cache, others see it on entry.
-    fn finalize_or_cached(
-        &self,
-        statuses: Vec<ExitStatus>,
-    ) -> Result<RunOutput, RunError> {
-        let mut guard = self
-            .finalized
-            .lock()
-            .expect("finalized mutex poisoned");
+    fn finalize_or_cached(&self, statuses: Vec<ExitStatus>) -> Result<RunOutput, RunError> {
+        let mut guard = self.finalized.lock().expect("finalized mutex poisoned");
         if let Some(state) = guard.as_ref() {
             let state = Arc::clone(state);
             drop(guard);

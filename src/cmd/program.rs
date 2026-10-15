@@ -34,7 +34,9 @@ impl SingleCmd {
     /// environment by fork and `execvp`, which spends no extra processes, so the name is left to it.
     #[cfg(unix)]
     fn inherits_path(&self) -> bool {
-        !self.env_clear && !self.env_remove.iter().any(|k| k == "PATH") && !self.envs.iter().any(|(k, _)| k == "PATH")
+        !self.env_clear
+            && !self.env_remove.iter().any(|k| k == "PATH")
+            && !self.envs.iter().any(|(k, _)| k == "PATH")
     }
 
     pub(super) fn apply_to(&self, cmd: &mut Command) {
@@ -113,7 +115,9 @@ mod search {
             return Found::Nothing;
         }
         let mut head = Vec::with_capacity(HEAD_BYTES);
-        match std::fs::File::open(candidate).and_then(|f| f.take(HEAD_BYTES as u64).read_to_end(&mut head)) {
+        match std::fs::File::open(candidate)
+            .and_then(|f| f.take(HEAD_BYTES as u64).read_to_end(&mut head))
+        {
             Ok(_) => format_of(&head),
             Err(_) => Found::Unsure,
         }
@@ -124,7 +128,9 @@ mod search {
 
     /// Executable by this process's effective ids, which is what exec checks.
     fn executable(path: &Path) -> bool {
-        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
         // SAFETY: `c` is a NUL-terminated string that outlives the call.
         unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
     }
@@ -151,7 +157,11 @@ mod search {
                 _ => Found::Unsure,
             };
         }
-        if NATIVE_MAGIC.iter().any(|m| head.starts_with(m)) { Found::Runnable } else { Found::Unsure }
+        if NATIVE_MAGIC.iter().any(|m| head.starts_with(m)) {
+            Found::Runnable
+        } else {
+            Found::Unsure
+        }
     }
 
     /// The absolute interpreter path a `#!` line names, when the whole line was read. A `\r` is
@@ -160,7 +170,10 @@ mod search {
         let line = &line[..line.iter().position(|&b| b == b'\n')?];
         let start = line.iter().position(|&b| b != b' ' && b != b'\t')?;
         let rest = &line[start..];
-        let name = &rest[..rest.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(rest.len())];
+        let name = &rest[..rest
+            .iter()
+            .position(|&b| b == b' ' || b == b'\t')
+            .unwrap_or(rest.len())];
         let path = Path::new(OsStr::from_bytes(name));
         path.is_absolute().then_some(path)
     }
@@ -183,18 +196,30 @@ mod tests {
         let mut s = SingleCmd::new("jj".into());
         s.env_clear = env_clear;
         s.env_remove = env_remove.iter().map(OsString::from).collect();
-        s.envs = envs.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))).collect();
+        s.envs = envs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
         s
     }
 
     #[test]
     fn only_a_stage_that_leaves_path_alone_inherits_it() {
         assert!(stage(false, &[], &[]).inherits_path());
-        assert!(stage(false, &["HOME"], &[("LANG", "C")]).inherits_path(), "other variables do not matter");
-        assert!(!stage(true, &[], &[]).inherits_path(), "a cleared environment has no PATH of ours");
+        assert!(
+            stage(false, &["HOME"], &[("LANG", "C")]).inherits_path(),
+            "other variables do not matter"
+        );
+        assert!(
+            !stage(true, &[], &[]).inherits_path(),
+            "a cleared environment has no PATH of ours"
+        );
         assert!(!stage(false, &["PATH"], &[]).inherits_path());
         assert!(!stage(false, &[], &[("PATH", "/bin")]).inherits_path());
-        assert!(stage(false, &[], &[("Path", "/bin")]).inherits_path(), "std matches the key exactly on unix");
+        assert!(
+            stage(false, &[], &[("Path", "/bin")]).inherits_path(),
+            "std matches the key exactly on unix"
+        );
     }
 
     #[test]
@@ -218,18 +243,39 @@ mod tests {
 
     #[test]
     fn resolves_past_directories_that_lack_the_program() {
-        let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, c) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
         let want = write_file(c.path(), "tool", SCRIPT, 0o755);
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path(), c.path()])), Some(want));
+        assert_eq!(
+            resolve(
+                OsStr::new("tool"),
+                &path_of(&[a.path(), b.path(), c.path()])
+            ),
+            Some(want)
+        );
     }
 
     #[test]
     fn passes_over_what_the_os_would_not_run() {
-        let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, c) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
         write_file(a.path(), "tool", SCRIPT, 0o644);
         std::fs::create_dir(b.path().join("tool")).unwrap();
         let want = write_file(c.path(), "tool", SCRIPT, 0o755);
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path(), c.path()])), Some(want), "a non-executable file and a directory are skipped");
+        assert_eq!(
+            resolve(
+                OsStr::new("tool"),
+                &path_of(&[a.path(), b.path(), c.path()])
+            ),
+            Some(want),
+            "a non-executable file and a directory are skipped"
+        );
     }
 
     #[test]
@@ -238,7 +284,11 @@ mod tests {
         let target = write_file(real.path(), "tool-1.2", SCRIPT, 0o755);
         let link = bin.path().join("tool");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[bin.path()])), Some(link), "a package upgrade moves the target, not the link");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &path_of(&[bin.path()])),
+            Some(link),
+            "a package upgrade moves the target, not the link"
+        );
     }
 
     #[test]
@@ -246,14 +296,26 @@ mod tests {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         write_file(b.path(), "tool", SCRIPT, 0o755);
         write_file(a.path(), "tool", b"echo no shebang\n", 0o755);
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])), None, "a script without #! may be run by /bin/sh");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])),
+            None,
+            "a script without #! may be run by /bin/sh"
+        );
         write_file(a.path(), "tool", b"#!/no/such/interpreter\n", 0o755);
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])), None, "the OS moves past a missing interpreter");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])),
+            None,
+            "the OS moves past a missing interpreter"
+        );
         let locked = write_file(a.path(), "tool", SCRIPT, 0o111);
         // Root reads it anyway, and then it is simply runnable.
         let unreadable = std::fs::File::open(&locked).is_err();
         let expected = if unreadable { None } else { Some(locked) };
-        assert_eq!(resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])), expected, "executable but unreadable");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &path_of(&[a.path(), b.path()])),
+            expected,
+            "executable but unreadable"
+        );
     }
 
     #[test]
@@ -266,10 +328,18 @@ mod tests {
         assert_eq!(resolve(OsStr::new("tool"), &relative_first), None);
         let mut empty_first = OsString::from(":");
         empty_first.push(&bin_path);
-        assert_eq!(resolve(OsStr::new("tool"), &empty_first), None, "an empty entry is the working directory");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &empty_first),
+            None,
+            "an empty entry is the working directory"
+        );
         let mut relative_after = bin_path.clone();
         relative_after.push(":bin");
-        assert_eq!(resolve(OsStr::new("tool"), &relative_after), Some(want), "entries after the program do not matter");
+        assert_eq!(
+            resolve(OsStr::new("tool"), &relative_after),
+            Some(want),
+            "entries after the program do not matter"
+        );
     }
 
     #[test]
@@ -280,7 +350,11 @@ mod tests {
         for name in ["", "./tool", "sub/tool", "to\0ol"] {
             assert_eq!(resolve(OsStr::new(name), &path), None, "{name:?}");
         }
-        assert_eq!(resolve(OsStr::new("absent"), &path), None, "a name found nowhere is the OS's to report");
+        assert_eq!(
+            resolve(OsStr::new("absent"), &path),
+            None,
+            "a name found nowhere is the OS's to report"
+        );
     }
 
     #[test]
@@ -289,10 +363,26 @@ mod tests {
         let head: Vec<u8> = std::fs::read(&exe).unwrap().into_iter().take(512).collect();
         assert_eq!(format_of(&head), Found::Runnable, "this test binary");
         assert_eq!(format_of(b"#!/bin/sh\n"), Found::Runnable);
-        assert_eq!(format_of(b"#! /bin/sh -e\n"), Found::Runnable, "space before the interpreter, arguments after");
-        assert_eq!(format_of(b"#!/bin/sh\r\n"), Found::Unsure, "the kernel reads the \\r as part of the name");
-        assert_eq!(format_of(b"#!sh\n"), Found::Unsure, "a relative interpreter");
-        assert_eq!(format_of(b"#!/bin/sh"), Found::Unsure, "a #! line longer than the bytes read");
+        assert_eq!(
+            format_of(b"#! /bin/sh -e\n"),
+            Found::Runnable,
+            "space before the interpreter, arguments after"
+        );
+        assert_eq!(
+            format_of(b"#!/bin/sh\r\n"),
+            Found::Unsure,
+            "the kernel reads the \\r as part of the name"
+        );
+        assert_eq!(
+            format_of(b"#!sh\n"),
+            Found::Unsure,
+            "a relative interpreter"
+        );
+        assert_eq!(
+            format_of(b"#!/bin/sh"),
+            Found::Unsure,
+            "a #! line longer than the bytes read"
+        );
         assert_eq!(format_of(b""), Found::Unsure);
         assert_eq!(format_of(b"echo hi\n"), Found::Unsure);
     }

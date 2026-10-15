@@ -41,7 +41,10 @@ fn dropping_a_spawned_process_kills_and_reaps_it() {
     let pid = proc.pids()[0];
     assert!(alive(pid), "the child should be running before the drop");
     drop(proc);
-    assert!(gone_within_deadline(pid), "the dropped handle left pid {pid} running");
+    assert!(
+        gone_within_deadline(pid),
+        "the dropped handle left pid {pid} running"
+    );
 }
 
 #[test]
@@ -54,7 +57,10 @@ fn dropping_a_spawned_pipeline_kills_every_stage() {
     let pids = proc.pids();
     drop(proc);
     for pid in pids {
-        assert!(gone_within_deadline(pid), "the dropped pipeline left stage {pid} running");
+        assert!(
+            gone_within_deadline(pid),
+            "the dropped pipeline left stage {pid} running"
+        );
     }
 }
 
@@ -72,7 +78,11 @@ fn dropping_a_finished_spawned_process_is_harmless() {
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn dropping_an_async_spawned_process_kills_it() {
-    let proc = Cmd::new(PP_SLEEP).arg("30000").spawn_async().await.expect("spawn");
+    let proc = Cmd::new(PP_SLEEP)
+        .arg("30000")
+        .spawn_async()
+        .await
+        .expect("spawn");
     let pid = proc.pids()[0];
     drop(proc);
     let gone = tokio::task::spawn_blocking(move || gone_within_deadline(pid))
@@ -101,7 +111,13 @@ fn second_run_stdin(mode: &str) -> String {
     });
     assert!(status.success(), "{mode}: pp_rerun_reader failed: {status}");
     let mut out = String::new();
-    probe.0.stdout.take().expect("stdout").read_to_string(&mut out).expect("read");
+    probe
+        .0
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut out)
+        .expect("read");
     out
 }
 
@@ -128,7 +144,10 @@ fn a_taken_reader_leaves_a_later_spawn_an_empty_stdin() {
     )));
     let first = cmd.clone().spawn().expect("first spawn");
     let second = cmd.spawn().expect("second spawn");
-    let first = first.wait_timeout(Duration::from_secs(10)).expect("wait").expect("first exits");
+    let first = first
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("first exits");
     let second = second
         .wait_timeout(Duration::from_secs(10))
         .expect("wait")
@@ -167,7 +186,11 @@ fn read_pid_within_deadline(path: &std::path::Path) -> u32 {
         {
             return pid;
         }
-        assert!(std::time::Instant::now() < deadline, "no pid in {}", path.display());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no pid in {}",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }

@@ -145,7 +145,9 @@ fn is_assignment(word: &str) -> bool {
         return false;
     };
     let mut chars = name.chars();
-    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
@@ -153,10 +155,7 @@ fn needs_quote(word: &str) -> bool {
     word.is_empty()
         || word.chars().any(|c| {
             !(c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
-                ))
+                || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','))
         })
 }
 
@@ -282,9 +281,16 @@ mod tests {
         d.push_stage("grep".into(), vec!["foo".into()]);
         let stages = d.stages();
         assert_eq!(stages[0].program(), &OsString::from("git"));
-        assert_eq!(stages[0].raw_args(), [OsString::from("log"), OsString::from("-5")]);
+        assert_eq!(
+            stages[0].raw_args(),
+            [OsString::from("log"), OsString::from("-5")]
+        );
         assert_eq!(stages[1].program(), &OsString::from("grep"));
-        assert_eq!(stages[1].raw_args(), [OsString::from("foo")], "secret redacts Display, not the raw args");
+        assert_eq!(
+            stages[1].raw_args(),
+            [OsString::from("foo")],
+            "secret redacts Display, not the raw args"
+        );
     }
 
     #[test]
@@ -302,9 +308,21 @@ mod tests {
     fn program_that_reads_as_an_assignment_is_quoted() {
         assert_eq!(cd("f=", &["x"], false).to_string(), "'f=' x");
         assert_eq!(cd("A_1=b", &[], true).to_string(), "'A_1=b' <secret>");
-        assert_eq!(cd("x", &["f=1"], false).to_string(), "x f=1", "an argument is not in command position");
-        assert_eq!(cd("=f", &[], false).to_string(), "=f", "no name before the =");
-        assert_eq!(cd("1a=b", &[], false).to_string(), "1a=b", "a name cannot start with a digit");
+        assert_eq!(
+            cd("x", &["f=1"], false).to_string(),
+            "x f=1",
+            "an argument is not in command position"
+        );
+        assert_eq!(
+            cd("=f", &[], false).to_string(),
+            "=f",
+            "no name before the ="
+        );
+        assert_eq!(
+            cd("1a=b", &[], false).to_string(),
+            "1a=b",
+            "a name cannot start with a digit"
+        );
     }
 
     #[test]
@@ -312,9 +330,16 @@ mod tests {
         assert_eq!(cd("if", &["x"], false).to_string(), "'if' x");
         let mut d = cd("git", &["log"], false);
         d.push_stage("done".into(), vec![]);
-        assert_eq!(d.to_string(), "git log | 'done'", "every stage's program is in command position");
-        assert_eq!(cd("x", &["if"], false).to_string(), "x if", "an argument is not in command position");
+        assert_eq!(
+            d.to_string(),
+            "git log | 'done'",
+            "every stage's program is in command position"
+        );
+        assert_eq!(
+            cd("x", &["if"], false).to_string(),
+            "x if",
+            "an argument is not in command position"
+        );
         assert_eq!(cd("iff", &[], false).to_string(), "iff");
     }
-
 }

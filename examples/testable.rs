@@ -26,8 +26,7 @@ fn main() {
         // In tests, pass a `MockRunner` with canned outputs.
         use procpilot::testing::{MockRunner, ok_str};
         let mock = MockRunner::new().expect("git branch --show-current", ok_str("main\n"));
-        let branch =
-            current_branch(&mock, Path::new("/repo")).expect("mock returns canned output");
+        let branch = current_branch(&mock, Path::new("/repo")).expect("mock returns canned output");
         println!("mocked branch: {branch}");
         mock.verify().expect("all expectations matched");
     }

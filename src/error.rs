@@ -247,10 +247,7 @@ impl fmt::Display for RunError {
                 if trimmed.is_empty() {
                     write!(f, "`{command}` cancelled by caller")
                 } else {
-                    write!(
-                        f,
-                        "`{command}` cancelled by caller; last stderr: {trimmed}"
-                    )
+                    write!(f, "`{command}` cancelled by caller; last stderr: {trimmed}")
                 }
             }
         }
@@ -511,8 +508,11 @@ mod tests {
 
     #[test]
     fn secret_command_in_display() {
-        let cmd_secret =
-            CmdDisplay::new("docker".into(), vec!["login".into(), "hunter2".into()], true);
+        let cmd_secret = CmdDisplay::new(
+            "docker".into(),
+            vec!["login".into(), "hunter2".into()],
+            true,
+        );
         let err = RunError::Spawn {
             command: cmd_secret,
             source: io::Error::new(io::ErrorKind::NotFound, "missing"),

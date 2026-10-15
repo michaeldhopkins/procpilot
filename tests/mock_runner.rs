@@ -26,8 +26,8 @@ fn mock_returns_canned_stdout() {
 
 #[test]
 fn mock_returns_canned_error() {
-    let mock = MockRunner::new()
-        .expect("git fetch", nonzero(128, "fatal: unable to access remote"));
+    let mock =
+        MockRunner::new().expect("git fetch", nonzero(128, "fatal: unable to access remote"));
     let err = (&mock as &dyn Runner)
         .run(Cmd::new("git").arg("fetch"))
         .expect_err("mock returned Err");
@@ -98,9 +98,7 @@ fn no_match_returns_spawn_error_when_configured() {
 #[test]
 fn spawn_error_helper_constructs_typed_error() {
     let mock = MockRunner::new().expect("missing-binary", spawn_error("not on PATH"));
-    let err = mock
-        .run(Cmd::new("missing-binary"))
-        .expect_err("err");
+    let err = mock.run(Cmd::new("missing-binary")).expect_err("err");
     assert!(err.is_spawn_failure());
 }
 
@@ -149,23 +147,22 @@ fn expect_repeated_matches_up_to_n_times() {
 #[test]
 fn expect_always_matches_unlimited_times() {
     use procpilot::testing::ok_str;
-    let mock = MockRunner::new().expect_always("git config core.hooksPath", || {
-        ok_str(".husky\n")
-    });
+    let mock = MockRunner::new().expect_always("git config core.hooksPath", || ok_str(".husky\n"));
     for _ in 0..10 {
         let out = mock
             .run(Cmd::new("git").args(["config", "core.hooksPath"]))
             .expect("ok");
         assert_eq!(out.stdout_lossy(), ".husky\n");
     }
-    mock.verify().expect("always-matching expectation counts as met after first call");
+    mock.verify()
+        .expect("always-matching expectation counts as met after first call");
 }
 
 #[test]
 fn expect_repeated_with_varying_factory_output() {
     use procpilot::testing::ok_str;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     let mock = MockRunner::new().expect_repeated("git log", 3, move || {
@@ -222,7 +219,9 @@ fn mock_result_resolve_covers_every_variant() {
     assert!(err.is_spawn_failure());
 
     // Timeout
-    let err = timeout(Duration::from_secs(1), "hung").resolve(&cmd).expect_err("Err");
+    let err = timeout(Duration::from_secs(1), "hung")
+        .resolve(&cmd)
+        .expect_err("Err");
     assert!(err.is_timeout());
 
     // If this test fails to compile (not: fails at runtime) because of a

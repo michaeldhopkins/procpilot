@@ -55,18 +55,21 @@ fn matrix_targets(name: &str) -> Vec<String> {
         .find(|l| l.starts_with("target: ["))
         .unwrap_or_else(|| panic!("{name} declares no `target: [...]` matrix"));
 
-    let inner = line
-        .trim_start_matches("target: [")
-        .trim_end_matches(']');
-    let mut out: Vec<String> =
-        inner.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let inner = line.trim_start_matches("target: [").trim_end_matches(']');
+    let mut out: Vec<String> = inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     out.sort();
     out
 }
 
 fn workflow(name: &str) -> String {
     std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows").join(name),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".github/workflows")
+            .join(name),
     )
     .unwrap_or_else(|e| panic!("read {name}: {e}"))
 }
@@ -75,7 +78,10 @@ fn workflow(name: &str) -> String {
 fn corpus_cache_keys(src: &str) -> Vec<String> {
     src.lines()
         .map(str::trim)
-        .filter_map(|l| l.strip_prefix("key: ").or_else(|| l.strip_prefix("restore-keys: ")))
+        .filter_map(|l| {
+            l.strip_prefix("key: ")
+                .or_else(|| l.strip_prefix("restore-keys: "))
+        })
         .filter(|v| v.starts_with("fuzz-corpus-"))
         .map(str::to_string)
         .collect()
@@ -86,7 +92,11 @@ const MATRIX_CORPUS_PREFIX: &str = "fuzz-corpus-${{ matrix.target }}-";
 #[test]
 fn every_fuzz_target_is_wired_into_the_burst() {
     let declared = declared_targets();
-    assert!(declared.len() >= 2, "only {} targets found — the Cargo.toml parse is wrong", declared.len());
+    assert!(
+        declared.len() >= 2,
+        "only {} targets found — the Cargo.toml parse is wrong",
+        declared.len()
+    );
     assert_eq!(
         declared,
         matrix_targets("fuzz.yml"),
@@ -100,9 +110,14 @@ fn the_replay_restores_the_corpus_the_burst_saves() {
     let burst = corpus_cache_keys(&workflow("fuzz.yml"));
     let replay = corpus_cache_keys(&workflow("fuzz-replay.yml"));
 
-    let saved: Vec<&String> =
-        burst.iter().filter(|k| k.starts_with(MATRIX_CORPUS_PREFIX) && k.len() > MATRIX_CORPUS_PREFIX.len()).collect();
-    assert!(!saved.is_empty(), "fuzz.yml saves no per-target corpus under `{MATRIX_CORPUS_PREFIX}<unique>`: {burst:?}");
+    let saved: Vec<&String> = burst
+        .iter()
+        .filter(|k| k.starts_with(MATRIX_CORPUS_PREFIX) && k.len() > MATRIX_CORPUS_PREFIX.len())
+        .collect();
+    assert!(
+        !saved.is_empty(),
+        "fuzz.yml saves no per-target corpus under `{MATRIX_CORPUS_PREFIX}<unique>`: {burst:?}"
+    );
     assert!(
         replay.iter().any(|k| k == MATRIX_CORPUS_PREFIX),
         "fuzz-replay.yml does not restore by the prefix `{MATRIX_CORPUS_PREFIX}` the burst saves under \
@@ -143,7 +158,8 @@ fn the_burst_saves_only_a_merged_corpus_and_fails_on_a_broken_burst() {
          failed merge makes a half-merged corpus canonical for every later replay"
     );
     assert!(
-        src.contains("FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}") && src.contains(r#"[ "$FUZZ_OUTCOME" != success ]"#),
+        src.contains("FUZZ_OUTCOME: ${{ steps.fuzz.outcome }}")
+            && src.contains(r#"[ "$FUZZ_OUTCOME" != success ]"#),
         "fuzz.yml's crash check must also fail on a non-success burst outcome: the burst step is \
          continue-on-error, so a burst that broke without writing an artifact would otherwise be green"
     );
@@ -155,7 +171,9 @@ fn the_burst_saves_only_a_merged_corpus_and_fails_on_a_broken_burst() {
         .expect("fuzz.yml does not run `bash fuzz/burst.sh`");
     assert_eq!(
         // `${{ matrix.target }}` holds spaces of its own; count it as one word.
-        call.replace("${{ matrix.target }}", "T").split_whitespace().count(),
+        call.replace("${{ matrix.target }}", "T")
+            .split_whitespace()
+            .count(),
         3,
         "fuzz/burst.sh takes <binary> <target> <budget> and refuses anything else: `{call}`"
     );
