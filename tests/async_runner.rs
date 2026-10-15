@@ -677,3 +677,170 @@ async fn spawn_async_kill_stops_the_child() {
     assert!(err.is_non_zero_exit(), "expected NonZeroExit, got {err:?}");
     assert!(start.elapsed() < Duration::from_secs(5), "kill did not stop the 8s sleep");
 }
+
+#[tokio::test]
+async fn run_async_past_deadline_times_out_before_spawning() {
+    // A program that does not exist: spawning it would be a Spawn error, so a Timeout shows the
+    // deadline was checked first.
+    let err = Cmd::new("/nonexistent/procpilot-no-such-program")
+        .deadline(Instant::now() - Duration::from_secs(1))
+        .run_async()
+        .await
+        .expect_err("fail");
+    assert!(err.is_timeout(), "expected Timeout, got {err:?}");
+    assert_eq!(err.attempts(), 1);
+}
+
+#[tokio::test]
+async fn run_async_past_deadline_times_out_before_the_first_retry_attempt() {
+    let err = Cmd::new("/nonexistent/procpilot-no-such-program")
+        .retry(RetryPolicy::default())
+        .deadline(Instant::now() - Duration::from_secs(1))
+        .run_async()
+        .await
+        .expect_err("fail");
+    assert!(err.is_timeout(), "expected Timeout, got {err:?}");
+    assert_eq!(err.attempts(), 1);
+}
+
+#[tokio::test]
+async fn run_async_deadline_ahead_lets_a_quick_command_run() {
+    let out = Cmd::new(PP_ECHO)
+        .arg("in time")
+        .deadline(Instant::now() + Duration::from_secs(30))
+        .run_async()
+        .await
+        .expect("a deadline 30s away must not stop a quick command");
+    assert_eq!(out.stdout_lossy().trim(), "in time");
+}
+
+#[tokio::test]
+async fn run_async_deadline_ahead_lets_a_retrying_command_run() {
+    let out = Cmd::new(PP_ECHO)
+        .arg("in time")
+        .retry(RetryPolicy::default())
+        .deadline(Instant::now() + Duration::from_secs(30))
+        .run_async()
+        .await
+        .expect("a deadline 30s away must not stop a quick command");
+    assert_eq!(out.stdout_lossy().trim(), "in time");
+}
+
+#[tokio::test]
+async fn run_async_cancel_with_a_timeout_lets_a_quick_command_finish() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // With both set, the wait goes through the cancel-polling loop, which checks the timeout itself.
+    let out = Cmd::new(PP_ECHO)
+        .arg("hello")
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .timeout(Duration::from_secs(30))
+        .run_async()
+        .await
+        .expect("ok");
+    assert_eq!(out.stdout_lossy().trim(), "hello");
+}
+
+#[tokio::test]
+async fn run_async_cancel_with_a_timeout_waits_out_the_timeout() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // The lower bound is what separates a timeout that fires when it is due from one that fires at
+    // once; it cannot flake on a slow machine.
+    let timeout = Duration::from_millis(400);
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .arg("8000")
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .timeout(timeout)
+        .run_async()
+        .await
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_timeout(), "expected Timeout, got {err:?}");
+    assert!(elapsed >= timeout, "timed out before {timeout:?}: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "timeout never fired: {elapsed:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_async_cancel_waits_out_the_grace_period_before_sigkill() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // The child ignores SIGTERM, so only the SIGKILL sent after the grace period stops it. A lower
+    // bound on elapsed time is what shows the grace was honoured; it cannot flake on a slow machine.
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+    let grace = Duration::from_millis(600);
+    let start = Instant::now();
+    let err = Cmd::new(PP_SLEEP)
+        .args(["8000", "--ignore-sigterm"])
+        .cancel(flag)
+        .cancel_grace(grace)
+        .run_async()
+        .await
+        .expect_err("fail");
+    let elapsed = start.elapsed();
+    assert!(err.is_cancelled(), "expected Cancelled, got {err:?}");
+    assert!(elapsed >= grace, "SIGKILL came before the {grace:?} grace ran out: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "SIGKILL never came: {elapsed:?}");
+}
+
+#[tokio::test]
+async fn run_async_unset_cancel_flag_still_sleeps_through_retry_backoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // With a cancel flag the backoff sleeps in polled steps; it must still sleep the full delay.
+    // The default policy waits 100 + 200 + 400ms before its three retries (jitter only adds), so
+    // a lower bound cannot flake on a slow machine.
+    let start = Instant::now();
+    let err = Cmd::new(PP_STATUS)
+        .arg("1")
+        .retry(RetryPolicy::default())
+        .retry_when(|_| true)
+        .cancel(Arc::new(AtomicBool::new(false)))
+        .run_async()
+        .await
+        .expect_err("fail");
+    assert_eq!(err.attempts(), 4);
+    assert!(
+        start.elapsed() >= Duration::from_millis(700),
+        "backoff was skipped: {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn run_async_pipeline_feeds_stdin_to_the_first_stage() {
+    // Bounded: if the feed went anywhere but stage one, its cat would wait for input forever.
+    let out = bounded(
+        Cmd::new(PP_CAT)
+            .stdin("piped through two cats\n")
+            .pipe(Cmd::new(PP_CAT))
+            .run_async(),
+    )
+    .await
+    .expect("ok");
+    assert_eq!(out.stdout_lossy(), "piped through two cats\n");
+}
+
+#[tokio::test]
+async fn spawn_async_pipeline_feeds_stdin_to_the_first_stage() {
+    let mut proc = Cmd::new(PP_CAT)
+        .stdin("fed to stage one\n")
+        .pipe(Cmd::new(PP_CAT))
+        .spawn_async()
+        .await
+        .expect("spawn");
+    // Bounded: if the feed went anywhere but stage one, its cat would wait for input forever.
+    let out = bounded(proc.wait()).await.expect("wait");
+    assert_eq!(out.stdout_lossy(), "fed to stage one\n");
+}

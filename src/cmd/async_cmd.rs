@@ -596,7 +596,7 @@ async fn execute_pipeline_async(
 
     let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> =
         Vec::new();
-    for _ in 0..stages.len() - 1 {
+    for _ in 1..stages.len() {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),
             source,
@@ -654,7 +654,7 @@ async fn execute_pipeline_async(
             stderr_tasks.push(tokio::spawn(async move { drain_async(stderr).await }));
         }
 
-        if i == stages.len() - 1 && matches!(stdout_mode, Redirection::Capture) {
+        if i == stages.len() - 1 {
             last_stdout = child.stdout.take();
         }
 
@@ -758,7 +758,7 @@ async fn spawn_pipeline_async(
 ) -> Result<AsyncSpawnedProcess, RunError> {
     let mut pipes: Vec<(Option<os_pipe::PipeReader>, Option<os_pipe::PipeWriter>)> =
         Vec::new();
-    for _ in 0..stages.len() - 1 {
+    for _ in 1..stages.len() {
         let (r, w) = os_pipe::pipe().map_err(|source| RunError::Spawn {
             command: display.clone(),
             source,
