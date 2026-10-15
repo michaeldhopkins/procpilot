@@ -61,6 +61,11 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+      - uses: taiki-e/install-action@cargo-machete
+
+      - name: cargo machete (unused dependencies)
+        run: cargo machete
+
   # The declared `rust-version` is a promise to downstream users; this is what keeps it true.
   # It reads the number from Cargo.toml, so the two cannot drift. The pinned toolchain
   # (rust-toolchain.toml) is overridden with `+`.
