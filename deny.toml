@@ -7,3 +7,12 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
 ]
+
+[advisories]
+# cargo-deny 0.20 denies vulnerabilities, unmaintained and unsound crates by default.
+# An ignore needs an id and a reason here.
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
