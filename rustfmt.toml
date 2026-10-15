@@ -1,0 +1,4 @@
+# Defaults on purpose: of max_width 100/110/120 and use_small_heuristics Default/Max, the
+# defaults left the fewest hunks in the code as it stood (126 against 127-250). edition makes
+# the style edition explicit rather than inherited from whichever cargo runs the check.
+edition = "2024"
