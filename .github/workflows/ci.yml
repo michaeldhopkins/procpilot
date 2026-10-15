@@ -52,3 +52,23 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny check
+
+  # The declared `rust-version` is a promise to downstream users; this is what keeps it true.
+  # It reads the number from Cargo.toml, so the two cannot drift. The pinned toolchain
+  # (rust-toolchain.toml) is overridden with `+`.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check on the declared rust-version
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --locked --all-features
+          cargo "+$msrv" check --locked --no-default-features
