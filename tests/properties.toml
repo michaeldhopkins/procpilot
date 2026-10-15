@@ -1,0 +1,44 @@
+# Every source file, classified. `tests/properties.rs` enforces it.
+#
+# A `pure` file's behaviour is a function of its inputs and names the property tests
+# (functions inside a `proptest!` block in that file) that cover it. An `effectful` file says
+# in a line why it is not pure. A pure file with no properties yet goes in `owed`, which may
+# only shrink: an entry that gains a property leaves in the same change.
+
+owed = [
+  "src/cmd_display.rs",
+  "src/error.rs",
+  "src/retry.rs",
+]
+
+[pure]
+"src/cmd/program.rs" = ["resolves_only_to_the_file_the_os_would_run"]
+"src/cmd_display.rs" = []
+"src/error.rs" = []
+"src/retry.rs" = []
+
+[effectful]
+"src/async_spawned.rs" = "owns async child processes and their pipes"
+"src/bin/pp_arg0.rs" = "mock child process: prints its own argv[0]"
+"src/bin/pp_cat.rs" = "mock child process: copies stdin to stdout"
+"src/bin/pp_child_grandchild.rs" = "mock child process: spawns a grandchild"
+"src/bin/pp_echo.rs" = "mock child process: writes arguments to stdout"
+"src/bin/pp_print_env.rs" = "mock child process: reads its environment"
+"src/bin/pp_print_env_multi.rs" = "mock child process: reads its environment"
+"src/bin/pp_pwd.rs" = "mock child process: reads its working directory"
+"src/bin/pp_rerun_reader.rs" = "mock child process: reads stdin"
+"src/bin/pp_sleep.rs" = "mock child process: sleeps and handles signals"
+"src/bin/pp_spam.rs" = "mock child process: floods stdout and stderr"
+"src/bin/pp_status.rs" = "mock child process: exits with a chosen status"
+"src/bin/support/orphan.rs" = "mock child support: watches for the parent's death"
+"src/cmd.rs" = "the Cmd builder runs subprocesses, spawns threads and reads clocks"
+"src/cmd/async_cmd.rs" = "runs subprocesses on a tokio runtime"
+"src/fuzz_api.rs" = "re-exports crate-private functions to the fuzz targets; no logic of its own"
+"src/lib.rs" = "module declarations and re-exports"
+"src/redirection.rs" = "holds file handles the child will inherit"
+"src/runner.rs" = "free functions that run subprocesses"
+"src/runner_trait.rs" = "the Runner trait; its implementations run subprocesses"
+"src/spawned.rs" = "owns child processes, pipes and a wait thread"
+"src/spawned/read.rs" = "reads from a child's pipe"
+"src/stdin.rs" = "holds one-shot readers and feeds a child's stdin"
+"src/testing.rs" = "MockRunner records calls behind a mutex"
