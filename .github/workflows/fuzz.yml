@@ -26,6 +26,9 @@ on:
         description: "Mutation seconds per target, counted after the corpus loads (default 180). Keep under ~2400: the job times out at 60 min."
         default: "180"
 
+permissions:
+  contents: read
+
 # Never cancel a running burst: a cancelled job swallows a failing crash check. GitHub
 # keeps one pending run per group, so pushes landing mid-burst collapse into the newest,
 # which fuzzes the latest code anyway.
