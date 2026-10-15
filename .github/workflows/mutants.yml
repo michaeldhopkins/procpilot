@@ -37,7 +37,8 @@ jobs:
           # commit (push). A shallow clone has neither.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 
@@ -270,7 +271,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
 

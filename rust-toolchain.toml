@@ -1,0 +1,6 @@
+# An exact stable, so a new release's lints and formatting cannot turn CI red on code nobody
+# touched. Move it to each new stable within 30 days and fix what its lints find. The
+# crate's MSRV (`rust-version` in Cargo.toml) is checked separately in ci.yml.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
