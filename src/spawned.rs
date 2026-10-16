@@ -187,9 +187,6 @@ impl SpawnedProcess {
     /// exited. Idempotent — after the first `Ok(Some(_))`, subsequent
     /// calls return the same cached outcome.
     pub fn try_wait(&self) -> Result<Option<RunOutput>, RunError> {
-        if let Some(state) = self.cached_state() {
-            return self.reconstruct(&state).map(Some);
-        }
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
             match c.try_wait() {
@@ -210,9 +207,6 @@ impl SpawnedProcess {
     /// [`RunError::NonZeroExit`] using pipefail status precedence.
     /// Idempotent — subsequent calls return the same cached outcome.
     pub fn wait(&self) -> Result<RunOutput, RunError> {
-        if let Some(state) = self.cached_state() {
-            return self.reconstruct(&state);
-        }
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
             let status = c.wait().map_err(|source| RunError::Spawn {
@@ -229,9 +223,6 @@ impl SpawnedProcess {
     /// [`kill`](Self::kill) or wait again. Idempotent once all stages
     /// have exited.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<RunOutput>, RunError> {
-        if let Some(state) = self.cached_state() {
-            return self.reconstruct(&state).map(Some);
-        }
         let start = Instant::now();
         let mut statuses = Vec::with_capacity(self.children.len());
         for c in &self.children {
@@ -248,13 +239,6 @@ impl SpawnedProcess {
             }
         }
         self.finalize_or_cached(statuses).map(Some)
-    }
-
-    fn cached_state(&self) -> Option<Arc<FinalizedState>> {
-        self.finalized
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(Arc::clone))
     }
 
     fn reconstruct(&self, state: &FinalizedState) -> Result<RunOutput, RunError> {

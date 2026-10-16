@@ -14,7 +14,7 @@ mod orphan;
 fn main() {
     orphan::exit_when_orphaned();
     let mut args = std::env::args().skip(1);
-    let code: i32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
+    let code: i32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
 
     let mut sleep_ms: u64 = 0;
 

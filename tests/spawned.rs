@@ -28,6 +28,12 @@ const PP_SPAM: &str = env!("CARGO_BIN_EXE_pp_spam");
 #[test]
 fn spawn_wait_captures_stdout() {
     let proc = Reaped(Cmd::new(PP_ECHO).arg("hi").spawn().expect("spawn"));
+    assert!(!proc.is_pipeline());
+    let dbg = format!("{:?}", *proc);
+    assert!(
+        dbg.contains("SpawnedProcess") && dbg.contains("pids"),
+        "{dbg}"
+    );
     let out = proc.wait().expect("wait");
     assert_eq!(out.stdout_lossy().trim(), "hi");
 }

@@ -286,8 +286,9 @@ fn secret_redacts_in_error_display() {
 }
 
 #[test]
-fn binary_available_true_for_exit_zero() {
+fn binary_available_true_for_exit_zero_and_false_for_nonzero() {
     assert!(procpilot::binary_available(PP_ECHO));
+    assert!(!procpilot::binary_available(PP_STATUS));
 }
 
 #[test]
@@ -296,7 +297,12 @@ fn binary_available_false_for_missing() {
 }
 
 #[test]
-fn binary_version_none_for_missing() {
+fn binary_version_returns_stdout_for_exit_zero_and_none_for_nonzero_or_missing() {
+    assert_eq!(
+        procpilot::binary_version(PP_ECHO).as_deref(),
+        Some("--version")
+    );
+    assert!(procpilot::binary_version(PP_STATUS).is_none());
     assert!(procpilot::binary_version("nonexistent_binary_xyz_42").is_none());
 }
 

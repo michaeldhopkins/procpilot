@@ -180,7 +180,22 @@ mod tests {
     }
 
     #[test]
-    fn debug_does_not_panic() {
-        let _ = format!("{:?}", RetryPolicy::default());
+    fn with_backoff_keeps_custom_schedule_and_default_predicate() {
+        use backon::BackoffBuilder;
+        let policy = RetryPolicy::with_backoff(ExponentialBuilder::default().with_max_times(0));
+        assert_eq!(policy.backoff.build().next(), None);
+        assert!((policy.predicate)(&fake_non_zero(
+            "The working copy is stale"
+        )));
+        assert!(!(policy.predicate)(&fake_spawn()));
+    }
+
+    #[test]
+    fn debug_includes_struct_and_fields() {
+        let s = format!("{:?}", RetryPolicy::default());
+        assert!(
+            s.contains("RetryPolicy") && s.contains("<ExponentialBuilder>"),
+            "{s}"
+        );
     }
 }

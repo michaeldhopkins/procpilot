@@ -267,25 +267,15 @@ impl std::error::Error for RunError {
 /// dropping from the front (oldest first). Used by the runner to bound
 /// captured output before constructing an error.
 pub(crate) fn truncate_suffix(mut buf: Vec<u8>) -> Vec<u8> {
-    if buf.len() > STREAM_SUFFIX_SIZE {
-        let drop = buf.len() - STREAM_SUFFIX_SIZE;
-        buf.drain(..drop);
-    }
+    buf.drain(..buf.len().saturating_sub(STREAM_SUFFIX_SIZE));
     buf
 }
 
 /// String version of [`truncate_suffix`].
-pub(crate) fn truncate_suffix_string(s: String) -> String {
-    if s.len() <= STREAM_SUFFIX_SIZE {
-        return s;
-    }
-    // Drop from the front. UTF-8 safe: find a char boundary.
-    let drop = s.len() - STREAM_SUFFIX_SIZE;
-    let mut start = drop;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    s[start..].to_string()
+pub(crate) fn truncate_suffix_string(mut s: String) -> String {
+    let start = s.ceil_char_boundary(s.len().saturating_sub(STREAM_SUFFIX_SIZE));
+    s.drain(..start);
+    s
 }
 
 #[cfg(test)]
@@ -497,13 +487,12 @@ mod tests {
 
     #[test]
     fn truncate_suffix_string_preserves_utf8() {
-        // Construct a string where the boundary cut would land mid-codepoint
-        // if not handled. Each 'é' is 2 bytes.
-        let s = format!("{}{}", "x".repeat(STREAM_SUFFIX_SIZE), "é".repeat(50));
+        // Put the 2-byte characters at the front and STREAM_SUFFIX_SIZE - 1 ASCII bytes at the
+        // tail, so `s.len() - STREAM_SUFFIX_SIZE` lands on the second byte of the last 'é'.
+        let tail = "x".repeat(STREAM_SUFFIX_SIZE - 1);
+        let s = format!("{}{tail}", "é".repeat(50));
         let truncated = truncate_suffix_string(s);
-        // Must be valid UTF-8 (compiler-enforced via String type, but make
-        // sure we didn't panic on a non-boundary index).
-        assert!(!truncated.is_empty());
+        assert_eq!(truncated, tail);
     }
 
     #[test]
