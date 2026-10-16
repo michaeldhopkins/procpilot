@@ -15,8 +15,17 @@ use tempfile::TempDir;
 const PP_ARG0: &str = env!("CARGO_BIN_EXE_pp_arg0");
 const PP_ECHO: &str = env!("CARGO_BIN_EXE_pp_echo");
 
-/// Directories on `PATH` ahead of the one holding the program.
-const MISSES: usize = 20;
+/// Directories on `PATH` ahead of the one holding the program. Many, so that a regression
+/// (MISSES + 1 PIDs a run) stands far above what other processes take in the same window.
+const MISSES: usize = 200;
+
+/// Under this many PIDs a run, the spawn did not search `PATH` by spawning. Half the
+/// regression's cost: a machine busy enough to take 10 PIDs in one window failed a limit of 10
+/// in 4 of 30 runs.
+const LIMIT: u32 = MISSES as u32 / 2;
+
+/// Runs measured; the quietest counts.
+const RUNS: usize = 10;
 
 /// A fresh process's PID, for measuring how many PIDs something in between consumed.
 fn probe_pid() -> u32 {
@@ -55,7 +64,7 @@ fn a_bare_name_spawns_one_process_and_keeps_its_name() {
 
     // Other processes on the machine take PIDs too, so take the quietest of several runs. Left to
     // posix_spawnp on macOS, every run costs MISSES + 1.
-    let fewest = (0..5)
+    let fewest = (0..RUNS)
         .filter_map(|_| {
             pids_consumed(|| {
                 Cmd::new("pp_arg0").run().unwrap();
@@ -64,7 +73,7 @@ fn a_bare_name_spawns_one_process_and_keeps_its_name() {
         .min()
         .unwrap();
     assert!(
-        fewest < 10,
+        fewest < LIMIT,
         "spawning by bare name consumed {fewest} PIDs; one process should take one"
     );
 
@@ -86,7 +95,7 @@ fn a_bare_name_spawns_one_process_and_keeps_its_name() {
             "pp_arg0",
             "the async path keeps argv[0] too"
         );
-        let fewest = (0..5)
+        let fewest = (0..RUNS)
             .filter_map(|_| {
                 pids_consumed(|| {
                     rt.block_on(Cmd::new("pp_arg0").run_async()).unwrap();
@@ -95,7 +104,7 @@ fn a_bare_name_spawns_one_process_and_keeps_its_name() {
             .min()
             .unwrap();
         assert!(
-            fewest < 10,
+            fewest < LIMIT,
             "the async path consumed {fewest} PIDs for one process"
         );
     }
