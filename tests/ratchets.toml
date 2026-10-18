@@ -1,0 +1,15 @@
+# Declarative quality ratchet manifest.
+lint_roots = ["src", "tests", "examples", "fuzz/fuzz_targets"]
+suppressions = 3
+check_baseline_lints = true
+fuzz_check_uploaded_binaries = true
+
+[rust_pinned]
+"src/cmd.rs" = 1779
+"src/cmd/async_cmd.rs" = 810
+"src/testing.rs" = 491
+
+[pinned_thresholds]
+"too-many-arguments-threshold" = 10
+"cognitive-complexity-threshold" = 30
+"too-many-lines-threshold" = 275
