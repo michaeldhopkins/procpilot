@@ -6,7 +6,6 @@
 # only shrink: an entry that gains a property leaves in the same change.
 
 owed = [
-  "src/error.rs",
   "src/retry.rs",
 ]
 
@@ -17,7 +16,12 @@ owed = [
   "needs_quote_accepts_exactly_the_safe_charset",
   "single_quote_is_a_perfect_shell_escape",
 ]
-"src/error.rs" = []
+"src/error.rs" = [
+  "truncate_suffix_matches_simple_reference",
+  "truncate_suffix_is_idempotent",
+  "truncate_suffix_string_matches_simple_reference",
+  "with_attempts_never_changes_a_spawn_error",
+]
 "src/retry.rs" = []
 
 [effectful]

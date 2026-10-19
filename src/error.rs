@@ -511,4 +511,81 @@ mod tests {
         assert!(msg.contains("docker"));
         assert!(msg.contains("<secret>"));
     }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        /// Simple reference for `truncate_suffix`: keep the input as-is if it fits, otherwise
+        /// return the last `STREAM_SUFFIX_SIZE` bytes. The implementation must agree with this
+        /// for every input — any drift is a real bug.
+        fn truncate_suffix_ref(buf: &[u8]) -> Vec<u8> {
+            let cap = super::STREAM_SUFFIX_SIZE;
+            if buf.len() <= cap {
+                buf.to_vec()
+            } else {
+                buf[buf.len() - cap..].to_vec()
+            }
+        }
+
+        /// Simple reference for `truncate_suffix_string`: same shape as `truncate_suffix_ref`,
+        /// but on a `&str`. The byte length of the input matches the byte length of a `String`
+        /// built from the same characters, so the slice math transfers directly.
+        fn truncate_suffix_string_ref(s: &str) -> String {
+            let cap = super::STREAM_SUFFIX_SIZE;
+            if s.len() <= cap {
+                s.to_string()
+            } else {
+                s[s.len() - cap..].to_string()
+            }
+        }
+
+        proptest! {
+            /// `truncate_suffix` agrees with a naive reference implementation: the output is
+            /// exactly the last `STREAM_SUFFIX_SIZE` bytes when the input overflows, and the
+            /// input itself otherwise. Drives lengths from 0 up to a small margin over the cap.
+            #[test]
+            fn truncate_suffix_matches_simple_reference(
+                buf in proptest::collection::vec(any::<u8>(), 0..=super::STREAM_SUFFIX_SIZE + 100),
+            ) {
+                let got = super::truncate_suffix(buf.clone());
+                let want = truncate_suffix_ref(&buf);
+                prop_assert_eq!(got, want, "input len = {}", buf.len());
+            }
+
+            /// `truncate_suffix` is idempotent: truncating a buffer that already fits the cap
+            /// (or any buffer) twice yields the same result as truncating once.
+            #[test]
+            fn truncate_suffix_is_idempotent(
+                buf in proptest::collection::vec(any::<u8>(), 0..=super::STREAM_SUFFIX_SIZE + 100),
+            ) {
+                let once = super::truncate_suffix(buf.clone());
+                let twice = super::truncate_suffix(once.clone());
+                prop_assert_eq!(twice, once);
+            }
+
+            /// `truncate_suffix_string` agrees with a naive reference on `&str`. The strategy
+            /// draws arbitrary Unicode (every char via `any::<char>()`), so the output must
+            /// remain valid UTF-8 and the byte-length-based slice must land on a char boundary.
+            /// `STREAM_SUFFIX_SIZE / 4 + 50` chars upper-bounds the byte length just over the cap.
+            #[test]
+            fn truncate_suffix_string_matches_simple_reference(
+                s in proptest::collection::vec(any::<char>(), 0..=super::STREAM_SUFFIX_SIZE / 4 + 50)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ) {
+                let got = super::truncate_suffix_string(s.clone());
+                let want = truncate_suffix_string_ref(&s);
+                prop_assert_eq!(got, want, "input byte len = {}", s.len());
+            }
+
+            /// `with_attempts` is a no-op on `Spawn`: whatever attempt number the retry loop
+            /// passes, the resulting error still reports `attempts() == 1`. (Spawn failures
+            /// do not trigger retries by default, so the field must not move.)
+            #[test]
+            fn with_attempts_never_changes_a_spawn_error(n in any::<u32>()) {
+                let err = super::spawn_error().with_attempts(n);
+                prop_assert_eq!(err.attempts(), 1u32);
+                prop_assert!(err.is_spawn_failure());
+            }
+        }
+    }
 }
