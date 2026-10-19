@@ -342,4 +342,87 @@ mod tests {
         );
         assert_eq!(cd("iff", &[], false).to_string(), "iff");
     }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        /// Reference check for `is_assignment`: the name before the first `=` is a shell
+        /// variable name — one leading `[A-Za-z_]` followed by zero or more `[A-Za-z0-9_]`.
+        fn is_assignment_ref(word: &str) -> bool {
+            match word.split_once('=') {
+                None => false,
+                Some((name, _)) => {
+                    let mut chars = name.chars();
+                    match chars.next() {
+                        None => false,
+                        Some(c) if !(c == '_' || c.is_ascii_alphabetic()) => false,
+                        Some(_) => chars.all(|c| c == '_' || c.is_ascii_alphanumeric()),
+                    }
+                }
+            }
+        }
+
+        /// Reference check for `needs_quote`: a word is fine to leave unquoted iff it is
+        /// non-empty and every character is one of the shell-safe characters the
+        /// implementation allow-lists.
+        fn needs_quote_ref(word: &str) -> bool {
+            if word.is_empty() {
+                return true;
+            }
+            word.chars().any(|c| {
+                !(c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','))
+            })
+        }
+
+        /// Naive single-quote-shell unescaper used as a roundtrip oracle for `single_quote`.
+        /// A single-quoted token is `'...'`; every embedded `'` is rendered as the four
+        /// characters `'\''` (close-quote, escape, open-quote). Returns `None` for input that
+        /// does not parse as a single-quoted token.
+        fn unquote_single_quoted(s: &str) -> Option<String> {
+            let body = s.strip_prefix('\'')?.strip_suffix('\'')?;
+            let mut out = String::with_capacity(body.len());
+            let mut rest = body;
+            while let Some(idx) = rest.find('\'') {
+                out.push_str(&rest[..idx]);
+                let after = &rest[idx..];
+                let tail = after.strip_prefix("'\\''")?;
+                out.push('\'');
+                rest = tail;
+            }
+            out.push_str(rest);
+            Some(out)
+        }
+
+        proptest! {
+            /// `is_assignment` matches a reference regex: `[A-Za-z_][A-Za-z0-9_]*=...`.
+            #[test]
+            fn is_assignment_matches_reference_pattern(word in ".*") {
+                let got = super::is_assignment(&word);
+                let want = is_assignment_ref(&word);
+                prop_assert_eq!(got, want, "word = {:?}", word);
+            }
+
+            /// `needs_quote` agrees with the explicit safe-character set: it is `false`
+            /// exactly when the word is non-empty and every character is in the allow-list.
+            #[test]
+            fn needs_quote_accepts_exactly_the_safe_charset(word in ".*") {
+                let got = super::needs_quote(&word);
+                let want = needs_quote_ref(&word);
+                prop_assert_eq!(got, want, "word = {:?}", word);
+            }
+
+            /// `single_quote` round-trips through a naive shell single-quote parser:
+            /// the produced token is always a single-quoted shell token, and unquoting
+            /// it (close-`'\\''`-open form) yields the original string back.
+            #[test]
+            fn single_quote_is_a_perfect_shell_escape(word in ".*") {
+                let quoted = super::single_quote(&word);
+                let unquoted = unquote_single_quoted(&quoted)
+                    .unwrap_or_else(|| panic!("not a single-quoted token: {quoted:?}"));
+                prop_assert_eq!(unquoted, word);
+                prop_assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
+            }
+        }
+    }
 }

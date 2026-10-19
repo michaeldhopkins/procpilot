@@ -6,14 +6,17 @@
 # only shrink: an entry that gains a property leaves in the same change.
 
 owed = [
-  "src/cmd_display.rs",
   "src/error.rs",
   "src/retry.rs",
 ]
 
 [pure]
 "src/cmd/program.rs" = ["resolves_only_to_the_file_the_os_would_run"]
-"src/cmd_display.rs" = []
+"src/cmd_display.rs" = [
+  "is_assignment_matches_reference_pattern",
+  "needs_quote_accepts_exactly_the_safe_charset",
+  "single_quote_is_a_perfect_shell_escape",
+]
 "src/error.rs" = []
 "src/retry.rs" = []
 
