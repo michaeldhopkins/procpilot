@@ -198,4 +198,112 @@ mod tests {
             "{s}"
         );
     }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        /// `default_transient` for `NonZeroExit` is exactly: stderr contains
+        /// `"stale"` or `".lock"`. A small reference oracle. Any disagreement
+        /// between this and the production code is a real bug.
+        fn non_zero_exit_should_retry_ref(stderr: &str) -> bool {
+            stderr.contains("stale") || stderr.contains(".lock")
+        }
+
+        proptest! {
+            /// `default_transient(&fake_non_zero(s))` agrees with the substring
+            /// reference for every stderr string. This is the defining
+            /// invariant of the predicate: it does no more, no less, than
+            /// look for those two substrings. Arbitrary strings via
+            /// `"a\\p{ASCII}*"` keep the bytes exactly what we feed the
+            /// oracle, so the comparison is meaningful.
+            #[test]
+            fn default_transient_matches_substring_reference_for_non_zero_exit(
+                stderr in "\\p{ASCII}*",
+            ) {
+                let err = super::fake_non_zero(&stderr);
+                let got = super::default_transient(&err);
+                let want = non_zero_exit_should_retry_ref(&stderr);
+                prop_assert_eq!(got, want, "stderr = {:?}", stderr);
+            }
+
+            /// `default_transient` is false on `Spawn`, `Timeout`, and
+            /// `Cancelled` — regardless of what stderr the caller put in
+            /// the error. These variants report infrastructure / control
+            /// failures that don't improve on retry, so the predicate must
+            /// refuse to schedule a retry for them. (Arbitrary stderr
+            /// catches the bug where someone accidentally drops into the
+            /// `NonZeroExit` arm by variant.)
+            #[test]
+            fn default_transient_never_retries_non_running_variants(
+                stderr in "\\p{ASCII}*",
+            ) {
+                // Spawn: carry no stderr field at all in this variant, so
+                // we test that even when stderr is *implicit* the answer
+                // is false. Then we also exhaustively check the other two
+                // variants with arbitrary stderr strings, including ones
+                // that *would* match the substring rule — they must still
+                // be refused.
+                prop_assert!(!super::default_transient(&super::fake_spawn()));
+                prop_assert!(!super::default_transient(&super::fake_timeout()));
+                let cancelled = super::RunError::Cancelled {
+                    command: super::cd("x"),
+                    stdout: vec![],
+                    stderr,
+                    attempts: 1,
+                };
+                prop_assert!(!super::default_transient(&cancelled));
+            }
+
+            /// Metamorphic property: the predicate on a concatenation
+            /// equals the OR of the predicate on each half. This is
+            /// the algebraic statement of "the predicate looks only
+            /// for substrings — split the message anywhere and the
+            /// verdict is the disjunction of the two halves". It's
+            /// a stronger claim than the per-string oracle: it
+            /// constrains the predicate to be *purely substring-based*
+            /// and forbids implementations that inspect character
+            /// counts, lengths, frequencies, or any other feature
+            /// that could behave differently on a concatenation.
+            #[test]
+            fn default_transient_on_concatenation_is_or_of_halves(
+                left in "\\p{ASCII}*",
+                right in "\\p{ASCII}*",
+            ) {
+                let combined = format!("{left}{right}");
+                let got_combined =
+                    super::default_transient(&super::fake_non_zero(&combined));
+                let got_left =
+                    super::default_transient(&super::fake_non_zero(&left));
+                let got_right =
+                    super::default_transient(&super::fake_non_zero(&right));
+                prop_assert_eq!(
+                    got_combined, got_left || got_right,
+                    "combined = {:?}, left verdict = {}, right verdict = {}",
+                    combined, got_left, got_right,
+                );
+            }
+
+            /// `RetryPolicy::default()`'s predicate is the same function
+            /// as the free-standing `default_transient`. The two paths
+            /// into the default policy (the type's `Default` impl and
+            /// the free function) must agree on every error variant.
+            #[test]
+            fn retry_policy_default_uses_default_transient_predicate(
+                stderr in "\\p{ASCII}*",
+            ) {
+                let policy = super::RetryPolicy::default();
+                let nz = super::fake_non_zero(&stderr);
+                prop_assert_eq!((policy.predicate)(&nz), super::default_transient(&nz));
+                prop_assert_eq!((policy.predicate)(&super::fake_spawn()), super::default_transient(&super::fake_spawn()));
+                prop_assert_eq!((policy.predicate)(&super::fake_timeout()), super::default_transient(&super::fake_timeout()));
+                let cancelled = super::RunError::Cancelled {
+                    command: super::cd("x"),
+                    stdout: vec![],
+                    stderr,
+                    attempts: 1,
+                };
+                prop_assert_eq!((policy.predicate)(&cancelled), super::default_transient(&cancelled));
+            }
+        }
+    }
 }

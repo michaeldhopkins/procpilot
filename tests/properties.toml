@@ -6,7 +6,6 @@
 # only shrink: an entry that gains a property leaves in the same change.
 
 owed = [
-  "src/retry.rs",
 ]
 
 [pure]
@@ -22,7 +21,12 @@ owed = [
   "truncate_suffix_string_matches_simple_reference",
   "with_attempts_never_changes_a_spawn_error",
 ]
-"src/retry.rs" = []
+"src/retry.rs" = [
+  "default_transient_matches_substring_reference_for_non_zero_exit",
+  "default_transient_never_retries_non_running_variants",
+  "default_transient_on_concatenation_is_or_of_halves",
+  "retry_policy_default_uses_default_transient_predicate",
+]
 
 [effectful]
 "src/async_spawned.rs" = "owns async child processes and their pipes"
