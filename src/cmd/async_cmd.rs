@@ -206,7 +206,6 @@ impl Cmd {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_one_attempt_async(
     tree: &CmdTree,
     stdin: &Option<super::SharedStdin>,
