@@ -17,7 +17,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use super::{
     AsyncStdinForAttempt, BeforeSpawnHook, CANCEL_POLL_INTERVAL, CancelControl, Cmd, CmdTree,
     Outcome, RunOutput, SingleCmd, attempt_stdin_async, combine_outcomes, finalize_outcome,
-    reject_non_capture_stdout_on_spawn,
+    preflight, reject_non_capture_stdout_on_spawn,
 };
 use crate::async_spawned::AsyncSpawnedProcess;
 use crate::cmd_display::CmdDisplay;
@@ -38,56 +38,29 @@ impl Cmd {
         let display = self.display();
         let stdin = self.stdin.take();
         let retry = self.retry.take();
-        let timeout = self.timeout;
         let deadline = self.deadline;
         let stdout_mode = self.stdout_mode.clone();
         let stderr_mode = self.stderr_mode.clone();
         let before_spawn = self.before_spawn.clone();
         let cancel = self.cancel.take();
-        let tree = self.tree;
+        let tree = &self.tree;
+        let cancel_ref = cancel.as_ref();
 
         // Pre-flight cancel check — same semantics as sync.
-        if let Some(c) = cancel.as_ref()
-            && c.is_set()
-        {
-            return Err(RunError::Cancelled {
-                command: display,
-                stdout: Vec::new(),
-                stderr: String::new(),
-                attempts: 1,
-            });
-        }
-
-        let cancel_ref = cancel.as_ref();
+        preflight::check(&display, cancel_ref, None, Instant::now(), 1)?;
 
         match retry {
             None => {
                 let now = Instant::now();
-                if let Some(d) = deadline
-                    && now >= d
-                {
-                    return Err(RunError::Timeout {
-                        command: display.clone(),
-                        elapsed: Duration::ZERO,
-                        stdout: Vec::new(),
-                        stderr: String::new(),
-                        attempts: 1,
-                    });
-                }
-                let per_attempt = match (timeout, deadline) {
-                    (None, None) => None,
-                    (Some(t), None) => Some(t),
-                    (None, Some(d)) => Some(d.saturating_duration_since(now)),
-                    (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
-                };
+                preflight::check(&display, None, deadline, now, 1)?;
                 run_one_attempt_async(
-                    &tree,
+                    tree,
                     &stdin,
                     &stdout_mode,
                     &stderr_mode,
                     before_spawn.as_ref(),
                     &display,
-                    per_attempt,
+                    self.per_attempt_timeout(now),
                     cancel_ref,
                 )
                 .await
@@ -98,42 +71,16 @@ impl Cmd {
                 let mut attempt_no: u32 = 0;
                 loop {
                     attempt_no = attempt_no.saturating_add(1);
-                    if let Some(c) = cancel_ref
-                        && c.is_set()
-                    {
-                        return Err(RunError::Cancelled {
-                            command: display.clone(),
-                            stdout: Vec::new(),
-                            stderr: String::new(),
-                            attempts: attempt_no,
-                        });
-                    }
                     let now = Instant::now();
-                    if let Some(d) = deadline
-                        && now >= d
-                    {
-                        return Err(RunError::Timeout {
-                            command: display.clone(),
-                            elapsed: Duration::ZERO,
-                            stdout: Vec::new(),
-                            stderr: String::new(),
-                            attempts: attempt_no,
-                        });
-                    }
-                    let per_attempt = match (timeout, deadline) {
-                        (None, None) => None,
-                        (Some(t), None) => Some(t),
-                        (None, Some(d)) => Some(d.saturating_duration_since(now)),
-                        (Some(t), Some(d)) => Some(t.min(d.saturating_duration_since(now))),
-                    };
+                    preflight::check(&display, cancel_ref, deadline, now, attempt_no)?;
                     let result = run_one_attempt_async(
-                        &tree,
+                        tree,
                         &stdin,
                         &stdout_mode,
                         &stderr_mode,
                         before_spawn.as_ref(),
                         &display,
-                        per_attempt,
+                        self.per_attempt_timeout(now),
                         cancel_ref,
                     )
                     .await;
@@ -581,6 +528,40 @@ async fn cancellable_sleep_async(delay: Duration, cancel: Option<&CancelControl>
     c.is_set()
 }
 
+/// Wait for each stage in order, returning every stage's outcome.
+async fn wait_stages_async(
+    children: &mut [Child],
+    timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
+) -> Vec<Outcome> {
+    let start = Instant::now();
+    let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
+
+    for i in 0..children.len() {
+        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
+            let _ = children[i].kill().await;
+            let _ = children[i].wait().await;
+            per_stage_status.push(Outcome::Cancelled);
+            continue;
+        }
+        let stage_start = Instant::now();
+        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome =
+            wait_single_async_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start)
+                .await;
+        if matches!(stage_outcome, Outcome::Cancelled) {
+            for (j, c) in children.iter_mut().enumerate() {
+                if j != i {
+                    let _ = c.kill().await;
+                    let _ = c.wait().await;
+                }
+            }
+        }
+        per_stage_status.push(stage_outcome);
+    }
+    per_stage_status
+}
+
 async fn execute_pipeline_async(
     stages: &[&SingleCmd],
     stdout_mode: &Redirection,
@@ -661,31 +642,7 @@ async fn execute_pipeline_async(
 
     let stdout_task = last_stdout.map(|s| tokio::spawn(async move { drain_async(s).await }));
 
-    let start = Instant::now();
-    let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
-
-    for i in 0..children.len() {
-        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
-            let _ = children[i].kill().await;
-            let _ = children[i].wait().await;
-            per_stage_status.push(Outcome::Cancelled);
-            continue;
-        }
-        let stage_start = Instant::now();
-        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
-        let stage_outcome =
-            wait_single_async_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start)
-                .await;
-        if matches!(stage_outcome, Outcome::Cancelled) {
-            for (j, c) in children.iter_mut().enumerate() {
-                if j != i {
-                    let _ = c.kill().await;
-                    let _ = c.wait().await;
-                }
-            }
-        }
-        per_stage_status.push(stage_outcome);
-    }
+    let per_stage_status = wait_stages_async(&mut children, timeout, cancel).await;
 
     let stdout_bytes = match stdout_task {
         Some(t) => t.await.unwrap_or_default(),

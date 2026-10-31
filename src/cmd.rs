@@ -58,6 +58,7 @@ use crate::stdin::StdinData;
 
 #[cfg(feature = "tokio")]
 mod async_cmd;
+mod preflight;
 mod program;
 
 /// Internal type alias for the `before_spawn` callback. Not part of the
@@ -863,16 +864,7 @@ impl Cmd {
         // Pre-flight: if cancellation is already requested before we spawn,
         // skip the work entirely. Documented behaviour — callers in a
         // "we're shutting down" state should not pay process startup cost.
-        if let Some(c) = cancel.as_ref()
-            && c.is_set()
-        {
-            return Err(RunError::Cancelled {
-                command: display,
-                stdout: Vec::new(),
-                stderr: String::new(),
-                attempts: 1,
-            });
-        }
+        preflight::check(&display, cancel.as_ref(), None, Instant::now(), 1)?;
 
         let cancel_ref = cancel.as_ref();
         let op =
@@ -965,29 +957,8 @@ where
 
         // Pre-attempt cancel check — covers both "flag set before we
         // started" and "flag set during a backoff sleep we just woke from".
-        if let Some(c) = cancel
-            && c.is_set()
-        {
-            return Err(RunError::Cancelled {
-                command: display.clone(),
-                stdout: Vec::new(),
-                stderr: String::new(),
-                attempts: attempt_no,
-            });
-        }
-
         let now = Instant::now();
-        if let Some(d) = deadline
-            && now >= d
-        {
-            return Err(RunError::Timeout {
-                command: display.clone(),
-                elapsed: Duration::ZERO,
-                stdout: Vec::new(),
-                stderr: String::new(),
-                attempts: attempt_no,
-            });
-        }
+        preflight::check(display, cancel, deadline, now, attempt_no)?;
         let per_attempt = match (timeout, deadline) {
             (None, None) => None,
             (Some(t), None) => Some(t),
@@ -1452,6 +1423,42 @@ fn read_to_end<R: Read>(mut reader: R) -> Vec<u8> {
     buf
 }
 
+/// Wait for each stage in order, returning every stage's outcome.
+fn wait_stages(
+    children: &mut [std::process::Child],
+    timeout: Option<Duration>,
+    cancel: Option<&CancelControl>,
+) -> Vec<Outcome> {
+    let start = Instant::now();
+    let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
+
+    for i in 0..children.len() {
+        // If cancellation already fired on a prior stage, kill the rest
+        // and mark them cancelled — no point waiting on them.
+        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
+            let _ = children[i].kill();
+            let _ = children[i].wait();
+            per_stage_status.push(Outcome::Cancelled);
+            continue;
+        }
+        let stage_start = Instant::now();
+        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
+        let stage_outcome =
+            wait_single_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start);
+        if matches!(stage_outcome, Outcome::Cancelled) {
+            // Kill every other stage right away so they don't continue running.
+            for (j, c) in children.iter_mut().enumerate() {
+                if j != i {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+        per_stage_status.push(stage_outcome);
+    }
+    per_stage_status
+}
+
 fn execute_pipeline(
     stages: &[&SingleCmd],
     stdout_mode: &Redirection,
@@ -1496,40 +1503,32 @@ fn execute_pipeline(
         }
 
         if i == stages.len() - 1 {
-            if let Err(e) = apply_stdout(&mut cmd, stdout_mode, display) {
-                kill_and_wait_std_children(&mut children);
-                return Err(e);
-            }
+            apply_stdout(&mut cmd, stdout_mode, display)
+                .map_err(|e| abort_stages(&mut children, e))?;
         } else {
             let writer = pipes[i].1.take().expect("pipe writer");
             cmd.stdout(Stdio::from(writer));
         }
 
-        if let Err(e) = apply_stderr(&mut cmd, stderr_mode, display) {
-            kill_and_wait_std_children(&mut children);
-            return Err(e);
-        }
+        apply_stderr(&mut cmd, stderr_mode, display).map_err(|e| abort_stages(&mut children, e))?;
 
-        if let Some(hook) = before_spawn
-            && let Err(source) = hook(&mut cmd)
-        {
-            kill_and_wait_std_children(&mut children);
-            return Err(RunError::Spawn {
+        if let Some(hook) = before_spawn {
+            let spawn_err = |source| RunError::Spawn {
                 command: display.clone(),
                 source,
-            });
+            };
+            hook(&mut cmd).map_err(|source| abort_stages(&mut children, spawn_err(source)))?;
         }
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(source) => {
-                kill_and_wait_std_children(&mut children);
-                return Err(RunError::Spawn {
+        let mut child = cmd.spawn().map_err(|source| {
+            abort_stages(
+                &mut children,
+                RunError::Spawn {
                     command: display.clone(),
                     source,
-                });
-            }
-        };
+                },
+            )
+        })?;
 
         if i == 0
             && let Some(data) = stdin_for_feed.take()
@@ -1554,33 +1553,7 @@ fn execute_pipeline(
     let last_stdout = children.last_mut().and_then(|child| child.stdout.take());
     let stdout_thread = last_stdout.map(|pipe| thread::spawn(move || read_to_end(pipe)));
 
-    let start = Instant::now();
-    let mut per_stage_status: Vec<Outcome> = Vec::with_capacity(children.len());
-
-    for i in 0..children.len() {
-        // If cancellation already fired on a prior stage, kill the rest
-        // and mark them cancelled — no point waiting on them.
-        if matches!(per_stage_status.last(), Some(Outcome::Cancelled)) {
-            let _ = children[i].kill();
-            let _ = children[i].wait();
-            per_stage_status.push(Outcome::Cancelled);
-            continue;
-        }
-        let stage_start = Instant::now();
-        let per_stage_timeout = timeout.map(|budget| budget.saturating_sub(start.elapsed()));
-        let stage_outcome =
-            wait_single_with_cancel(&mut children[i], per_stage_timeout, cancel, stage_start);
-        if matches!(stage_outcome, Outcome::Cancelled) {
-            // Kill every other stage right away so they don't continue running.
-            for (j, c) in children.iter_mut().enumerate() {
-                if j != i {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
-        }
-        per_stage_status.push(stage_outcome);
-    }
+    let per_stage_status = wait_stages(&mut children, timeout, cancel);
 
     if let Some(t) = stdin_thread {
         let _ = t.join();
@@ -1633,6 +1606,12 @@ fn kill_and_wait_std_children(children: &mut [std::process::Child]) {
         let _ = c.kill();
         let _ = c.wait();
     }
+}
+
+/// Clean up the stages spawned so far and hand `err` back for `?`.
+fn abort_stages(children: &mut [std::process::Child], err: RunError) -> RunError {
+    kill_and_wait_std_children(children);
+    err
 }
 
 /// Best-effort kill + wait across a shared-child pipeline.

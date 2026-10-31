@@ -44,6 +44,7 @@ owed = [
 "src/bin/support/orphan.rs" = "mock child support: watches for the parent's death"
 "src/cmd.rs" = "the Cmd builder runs subprocesses, spawns threads and reads clocks"
 "src/cmd/async_cmd.rs" = "runs subprocesses on a tokio runtime"
+"src/cmd/preflight.rs" = "reads the cancel flag another thread sets"
 "src/fuzz_api.rs" = "re-exports crate-private functions to the fuzz targets; no logic of its own"
 "src/lib.rs" = "module declarations and re-exports"
 "src/redirection.rs" = "holds file handles the child will inherit"
